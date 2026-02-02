@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartMeal AI - Test Page</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+        }
+        
+        .test-section {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .test-section h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
+            transition: transform 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .result {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 15px;
+            margin-top: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .success {
+            border-left-color: #28a745;
+            background: #d4edda;
+        }
+        
+        .error {
+            border-left-color: #dc3545;
+            background: #f8d7da;
+        }
+        
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .chat-messages {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            min-height: 300px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .message {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 8px;
+        }
+        
+        .message.user {
+            background: #667eea;
+            color: white;
+            margin-left: 20%;
+        }
+        
+        .message.assistant {
+            background: #e9ecef;
+            margin-right: 20%;
+        }
+        
+        .chat-input {
+            display: flex;
+            gap: 10px;
+        }
+        
+        input[type="text"] {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        
+        .status.online {
+            background: #28a745;
+            color: white;
+        }
+        
+        .status.offline {
+            background: #dc3545;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🍽️ SmartMeal AI - Test Page</h1>
+        
+        <!-- Test 1: Health Check -->
+        <div class="test-section">
+            <h2>1. Health Check</h2>
+            <p>Provjeri da li Python AI modul radi i je li spojen na bazu.</p>
+            <button onclick="testHealth()">Test Health</button>
+            <div id="health-result" class="result" style="display:none;"></div>
+        </div>
+        
+        <!-- Test 2: AI Recommendations -->
+        <div class="test-section">
+            <h2>2. AI Preporuke</h2>
+            <p>Testiraj AI recommendation engine s tvojim podacima.</p>
+            <button onclick="testRecommendations()">Test AI Preporuke</button>
+            <div id="recommendations-result" class="result" style="display:none;"></div>
+        </div>
+        
+        <!-- Test 3: WebSocket Chat -->
+        <div class="test-section">
+            <h2>3. WebSocket AI Chat Asistent</h2>
+            <p>Status: <span id="ws-status" class="status offline">Offline</span></p>
+            <button onclick="connectWebSocket()">Spoji se na WebSocket</button>
+            <button onclick="disconnectWebSocket()">Odspoji</button>
+            
+            <div class="chat-container" style="margin-top: 15px;">
+                <div id="chat-messages" class="chat-messages"></div>
+                <div class="chat-input">
+                    <input type="text" id="chat-input" placeholder="Napiši poruku..." onkeypress="handleKeyPress(event)">
+                    <button onclick="sendChatMessage()">Pošalji</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Test 4: Ingredient Substitution -->
+        <div class="test-section">
+            <h2>4. Zamjene sastojaka</h2>
+            <p>Testiraj predlaganje zamjena za sastojke.</p>
+            <input type="text" id="ingredient-input" placeholder="Upiši sastojak (npr. butter, milk, sugar)">
+            <button onclick="testSubstitution()">Traži zamjene</button>
+            <div id="substitution-result" class="result" style="display:none;"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        const API_URL = 'http://127.0.0.1:8001';
+        const WS_URL = 'ws://127.0.0.1:8001/ws/assistant/test-user-123';
+        
+        // Test 1: Health Check
+        async function testHealth() {
+            const resultDiv = document.getElementById('health-result');
+            resultDiv.style.display = 'block';
+            resultDiv.textContent = 'Testing...';
+            resultDiv.className = 'result';
+            
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                const data = await response.json();
+                
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                resultDiv.className = data.status === 'healthy' ? 'result success' : 'result error';
+            } catch (error) {
+                resultDiv.textContent = `Error: ${error.message}`;
+                resultDiv.className = 'result error';
+            }
+        }
+        
+        // Test 2: AI Recommendations
+        async function testRecommendations() {
+            const resultDiv = document.getElementById('recommendations-result');
+            resultDiv.style.display = 'block';
+            resultDiv.textContent = 'Testing AI recommendations...';
+            resultDiv.className = 'result';
+            
+            const testData = {
+                user_id: 1,
+                age: 30,
+                gender: "male",
+                weight: 80,
+                height: 180,
+                activity_level: "moderate",
+                preferences: "healthy vegetarian low-carb",
+                goals: {
+                    type: "weight_loss"
+                },
+                inventory: ["tofu", "spinach", "olive oil"],
+                diet_type: "vegetarian",
+                allergies: []
+            };
+            
+            try {
+                const response = await fetch(`${API_URL}/recommend-meals/`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(testData)
+                });
+                
+                const data = await response.json();
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                resultDiv.className = 'result success';
+            } catch (error) {
+                resultDiv.textContent = `Error: ${error.message}`;
+                resultDiv.className = 'result error';
+            }
+        }
+        
+        // Test 3: WebSocket
+        function connectWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                alert('Već si spojen!');
+                return;
+            }
+            
+            ws = new WebSocket(WS_URL);
+            
+            ws.onopen = () => {
+                document.getElementById('ws-status').textContent = 'Online';
+                document.getElementById('ws-status').className = 'status online';
+                addMessage('System', 'Spojen na AI asistenta!', 'assistant');
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                console.log('Received:', data);
+                
+                if (data.type === 'response') {
+                    addMessage('AI Asistent', data.content, 'assistant');
+                } else if (data.type === 'substitutions') {
+                    let message = `Zamjene za ${data.ingredient}:\n\n`;
+                    data.substitutions.forEach((sub, i) => {
+                        message += `${i + 1}. ${sub.substitute}\n`;
+                        message += `   Omjer: ${sub.ratio}\n`;
+                        message += `   Napomena: ${sub.note}\n\n`;
+                    });
+                    addMessage('AI Asistent', message, 'assistant');
+                } else {
+                    addMessage('AI Asistent', JSON.stringify(data, null, 2), 'assistant');
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                addMessage('System', 'Greška u konekciji!', 'assistant');
+            };
+            
+            ws.onclose = () => {
+                document.getElementById('ws-status').textContent = 'Offline';
+                document.getElementById('ws-status').className = 'status offline';
+                addMessage('System', 'Veza prekinuta.', 'assistant');
+            };
+        }
+        
+        function disconnectWebSocket() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+        
+        function sendChatMessage() {
+            const input = document.getElementById('chat-input');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('Prvo se spoji na WebSocket!');
+                return;
+            }
+            
+            addMessage('Ti', message, 'user');
+            
+            ws.send(JSON.stringify({
+                type: 'chat',
+                content: message
+            }));
+            
+            input.value = '';
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendChatMessage();
+            }
+        }
+        
+        function addMessage(sender, text, type) {
+            const messagesDiv = document.getElementById('chat-messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}`;
+            messageDiv.innerHTML = `<strong>${sender}:</strong><br>${text}`;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        // Test 4: Ingredient Substitution
+        function testSubstitution() {
+            const ingredient = document.getElementById('ingredient-input').value.trim();
+            
+            if (!ingredient) {
+                alert('Upiši sastojak!');
+                return;
+            }
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('Prvo se spoji na WebSocket!');
+                return;
+            }
+            
+            const resultDiv = document.getElementById('substitution-result');
+            resultDiv.style.display = 'block';
+            resultDiv.textContent = `Tražim zamjene za "${ingredient}"...`;
+            resultDiv.className = 'result';
+            
+            ws.send(JSON.stringify({
+                type: 'substitute',
+                ingredient: ingredient
+            }));
+        }
+    </script>
+</body>
+</html>
