@@ -267,10 +267,12 @@ def get_ingredients_for_recipe(recipe_id: int, db: Session) -> str:
 # Recipe Search (DB) by name + ingredients
 # =========================
 
-def find_recipes_in_db(query: str, db: Session, limit: int = 3) -> List[Dict]:
+# ✅ DODANO: user_id param i filtriranje Recipe.user_id
+def find_recipes_in_db(query: str, db: Session, user_id: int, limit: int = 3) -> List[Dict]:
     """
     Search recipes by name (phrase / OR tokens).
     Then attaches ingredients via JOIN function.
+    ONLY recipes of logged-in user.
     """
     q_raw = (query or "").strip()
     if not q_raw:
@@ -282,11 +284,23 @@ def find_recipes_in_db(query: str, db: Session, limit: int = 3) -> List[Dict]:
     results = []
 
     if q_clean:
-        results = db.query(Recipe).filter(Recipe.name.like(f"%{q_clean}%")).limit(limit).all()
+        results = (
+            db.query(Recipe)
+            .filter(Recipe.user_id == user_id)  # ✅ DODANO
+            .filter(Recipe.name.like(f"%{q_clean}%"))
+            .limit(limit)
+            .all()
+        )
 
     if not results and tokens:
         ors = [Recipe.name.like(f"%{t}%") for t in tokens]
-        results = db.query(Recipe).filter(or_(*ors)).limit(limit).all()
+        results = (
+            db.query(Recipe)
+            .filter(Recipe.user_id == user_id)  # ✅ DODANO
+            .filter(or_(*ors))
+            .limit(limit)
+            .all()
+        )
 
     final = []
     for r in results[:limit]:
@@ -300,11 +314,14 @@ def find_recipes_in_db(query: str, db: Session, limit: int = 3) -> List[Dict]:
 
     return final
 
-def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, limit: int = 3) -> List[Dict]:
+
+# ✅ DODANO: user_id param i filtriranje u SQL-u (r.user_id = :uid)
+def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, user_id: int, limit: int = 3) -> List[Dict]:
     """
     For messages like:
     - "imam piletinu i jaja"
     It finds recipes that have ingredients matching any token.
+    ONLY recipes of logged-in user.
     """
     tokens = [t for t in (tokens or []) if t and len(t) > 2]
     if not tokens:
@@ -312,7 +329,7 @@ def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, limit: int
 
     # Build dynamic OR for ingredient name LIKE
     where_parts = []
-    params = {"limit": limit}
+    params = {"limit": limit, "uid": user_id}  # ✅ DODANO uid
     for idx, tok in enumerate(tokens[:8]):
         key = f"t{idx}"
         where_parts.append(f"i.name LIKE :{key}")
@@ -325,7 +342,8 @@ def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, limit: int
         FROM recipes r
         JOIN ingredient_recipe ir ON ir.recipe_id = r.id
         JOIN ingredients i ON i.id = ir.ingredient_id
-        WHERE ({where_sql})
+        WHERE r.user_id = :uid   -- ✅ DODANO
+          AND ({where_sql})
         ORDER BY r.name
         LIMIT :limit
     """
@@ -388,9 +406,11 @@ def build_diet_advice(flags: Dict[str, bool]) -> str:
         return ""
     return "Evo preporuka:\n" + "\n".join(lines)
 
-def build_meal_ideas(meal_type: str, db: Session) -> str:
+# ✅ DODANO: user_id param, i prosljeđivanje u find_recipes_in_db
+def build_meal_ideas(meal_type: str, db: Session, user_id: int) -> str:
     """
     Tries to propose recipes from DB (if exist), otherwise gives generic ideas.
+    Uses ONLY recipes of logged-in user.
     """
     # Try DB-known demo words
     candidates = {
@@ -406,7 +426,7 @@ def build_meal_ideas(meal_type: str, db: Session) -> str:
         if len(found) >= 3:
             break
         try:
-            res = find_recipes_in_db(term, db, limit=3)
+            res = find_recipes_in_db(term, db, user_id=user_id, limit=3)  # ✅ DODANO user_id
             for r in res:
                 rid = r.get("id")
                 if rid and rid not in seen_ids:
@@ -462,7 +482,8 @@ def build_health_answer(food: str) -> str:
 # Chat Logic
 # =========================
 
-def get_cooking_tip(query: str, db: Session) -> str:
+# ✅ DODANO: user_id param i prosljeđivanje dalje (ništa se ne briše)
+def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
     q = normalize_text(query)
 
     # 0) "što sve možeš" (meta)
@@ -486,7 +507,7 @@ def get_cooking_tip(query: str, db: Session) -> str:
         # plus meal idea if meal type present
         meal_type = detect_meal_type(q)
         if meal_type:
-            return diet_text + "\n\n" + build_meal_ideas(meal_type, db)
+            return diet_text + "\n\n" + build_meal_ideas(meal_type, db, user_id=user_id)  # ✅ DODANO user_id
         return diet_text
 
     # 2) greeting
@@ -507,13 +528,13 @@ def get_cooking_tip(query: str, db: Session) -> str:
     if meal_type and (is_idea_question(q) or "za " in q or "ideja" in q):
         # ako i dijeta flag postoji, dodaj i to
         if diet_text:
-            return diet_text + "\n\n" + build_meal_ideas(meal_type, db)
-        return build_meal_ideas(meal_type, db)
+            return diet_text + "\n\n" + build_meal_ideas(meal_type, db, user_id=user_id)  # ✅ DODANO user_id
+        return build_meal_ideas(meal_type, db, user_id=user_id)  # ✅ DODANO user_id
 
     # 6) "imam ..." -> preporuči po sastojcima (JOIN)
     if "imam" in q:
         toks = extract_ingredients_after_imam(q)
-        recipes = find_recipes_by_ingredient_tokens(toks, db, limit=3)
+        recipes = find_recipes_by_ingredient_tokens(toks, db, user_id=user_id, limit=3)  # ✅ DODANO user_id
         if recipes:
             out = "Na temelju sastojaka koje imaš, možeš napraviti:\n"
             for r in recipes:
@@ -534,7 +555,7 @@ def get_cooking_tip(query: str, db: Session) -> str:
         if not term:
             term = _clean_recipe_query(q)
 
-        recipes = find_recipes_in_db(term, db, limit=3)
+        recipes = find_recipes_in_db(term, db, user_id=user_id, limit=3)  # ✅ DODANO user_id
         if recipes:
             out = "Evo što imam u bazi:\n"
             for r in recipes:
@@ -545,7 +566,8 @@ def get_cooking_tip(query: str, db: Session) -> str:
                     out += f"🔹 {r['name']}{kcal}\n"
             return out
 
-        return "Ne mogu pronaći taj recept u bazi. Probaj: 'recept pizza', 'recept kajgana' ili 'recept pileća salata'."
+        # ✅ DODANO: poruka kad korisnik nema taj recept (ne traži tuđe)
+        return "Nemate taj recept u svojoj bazi. Dodajte ga u svoje recepte ili napišite naziv nekog svog recepta."
 
     # 8) "što da jedem" bez meal type -> generički + (ako dijeta postoji već gore bi ušlo)
     if is_idea_question(q):
@@ -568,6 +590,12 @@ async def handle_websocket_message(websocket: WebSocket, user_id: str, message: 
 
     db = get_db_session()
     try:
+        # ✅ DODANO: pretvori user_id iz URL-a u int da ide u DB filtere
+        try:
+            uid = int(user_id)
+        except Exception:
+            uid = 0
+
         if message_type == "chat":
             # 1) substitution inside chat
             ing = extract_ingredient_from_text(content)
@@ -592,7 +620,7 @@ async def handle_websocket_message(websocket: WebSocket, user_id: str, message: 
                 return
 
             # 3) normal response
-            response = get_cooking_tip(content, db)
+            response = get_cooking_tip(content, db, user_id=uid)  # ✅ DODANO user_id
             await manager.send_personal_message(json.dumps({
                 "type": "response",
                 "content": response
