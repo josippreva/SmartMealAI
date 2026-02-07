@@ -87,11 +87,9 @@ def _clean_recipe_query(q: str) -> str:
     - "recept pileća salata" -> "pileća salata"
     """
     t = normalize_text(q)
-    # ukloni sve prije riječi "recept" ako postoji
     if "recept" in t:
         t = t.split("recept", 1)[1].strip()
 
-    # ukloni "za" na početku
     t = re.sub(r"^\s*za\s+", "", t).strip()
     t = t.strip(":").strip()
     return t
@@ -109,7 +107,6 @@ def extract_recipe_from_sentence(text_msg: str) -> str:
     if "recept" in t:
         t = t.split("recept", 1)[1].strip()
 
-    # remove common filler words
     t = re.sub(r"\b(za|mi|možeš|mozes|li|jel|je|imas|imaš|napisati|daj|molim|te|meni|da|bi)\b", " ", t)
     t = _strip_punct_keep_hr(t)
     t = re.sub(r"\s+", " ", t).strip()
@@ -139,8 +136,6 @@ def extract_ingredients_after_imam(text_msg: str) -> List[str]:
     if not part:
         return []
 
-    # split by commas if user had them originally (already removed punct),
-    # so just tokenize and keep "food-like" tokens
     toks = _tokenize_for_search(part)
     return toks
 
@@ -151,7 +146,6 @@ def extract_health_food(text_msg: str) -> str:
     """
     t = normalize_text(text_msg)
     t = t.replace("jel", "je li")
-    # grab after "je li" or "je li to"
     m = re.search(r"je\s+li\s+(.+?)\s+zdrav", t)
     if m:
         food = m.group(1)
@@ -160,6 +154,41 @@ def extract_health_food(text_msg: str) -> str:
         food = re.sub(r"\s+", " ", food).strip()
         return food
     return ""
+
+
+# =========================
+# ✅ NOVO: Extract max calories from sentence
+# =========================
+
+def extract_max_calories(text_msg: str) -> Optional[int]:
+    """
+    Hvata:
+    - "do 500 kalorija"
+    - "max 500 kcal"
+    - "ispod 300 kcal"
+    - "manje od 900 kalorija"
+    - "<= 700 kcal"
+    """
+    t = normalize_text(text_msg)
+
+    patterns = [
+        r"\bdo\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+        r"\bmax(?:imum)?\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+        r"\bispod\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+        r"\bmanje\s+od\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+        r"\b<=\s*(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+    ]
+
+    for p in patterns:
+        m = re.search(p, t)
+        if m:
+            try:
+                val = int(m.group(1))
+                if 50 <= val <= 5000:
+                    return val
+            except Exception:
+                pass
+    return None
 
 
 # =========================
@@ -264,16 +293,28 @@ def get_ingredients_for_recipe(recipe_id: int, db: Session) -> str:
 
 
 # =========================
+# ✅ NOVO: Format recipe output (name + kcal + ingredients + instructions)
+# =========================
+
+def format_recipe_block(r: Dict) -> str:
+    kcal = f" ({r['calories']} kcal)" if r.get("calories") is not None else ""
+    out = f"🔹 {r.get('name','')}{kcal}\n"
+
+    if r.get("ingredients"):
+        out += f"   Sastojci: {r['ingredients']}\n"
+
+    instr = (r.get("instructions") or "").strip()
+    if instr:
+        out += f"   Opis: {instr}\n"
+
+    return out
+
+
+# =========================
 # Recipe Search (DB) by name + ingredients
 # =========================
 
-# ✅ DODANO: user_id param i filtriranje Recipe.user_id
 def find_recipes_in_db(query: str, db: Session, user_id: int, limit: int = 3) -> List[Dict]:
-    """
-    Search recipes by name (phrase / OR tokens).
-    Then attaches ingredients via JOIN function.
-    ONLY recipes of logged-in user.
-    """
     q_raw = (query or "").strip()
     if not q_raw:
         return []
@@ -286,7 +327,7 @@ def find_recipes_in_db(query: str, db: Session, user_id: int, limit: int = 3) ->
     if q_clean:
         results = (
             db.query(Recipe)
-            .filter(Recipe.user_id == user_id)  # ✅ DODANO
+            .filter(Recipe.user_id == user_id)
             .filter(Recipe.name.like(f"%{q_clean}%"))
             .limit(limit)
             .all()
@@ -296,7 +337,7 @@ def find_recipes_in_db(query: str, db: Session, user_id: int, limit: int = 3) ->
         ors = [Recipe.name.like(f"%{t}%") for t in tokens]
         results = (
             db.query(Recipe)
-            .filter(Recipe.user_id == user_id)  # ✅ DODANO
+            .filter(Recipe.user_id == user_id)
             .filter(or_(*ors))
             .limit(limit)
             .all()
@@ -309,27 +350,20 @@ def find_recipes_in_db(query: str, db: Session, user_id: int, limit: int = 3) ->
             "id": r.id,
             "name": r.name,
             "calories": getattr(r, "calories", None),
-            "ingredients": ing_txt
+            "ingredients": ing_txt,
+            "instructions": getattr(r, "instructions", None)
         })
 
     return final
 
 
-# ✅ DODANO: user_id param i filtriranje u SQL-u (r.user_id = :uid)
 def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, user_id: int, limit: int = 3) -> List[Dict]:
-    """
-    For messages like:
-    - "imam piletinu i jaja"
-    It finds recipes that have ingredients matching any token.
-    ONLY recipes of logged-in user.
-    """
     tokens = [t for t in (tokens or []) if t and len(t) > 2]
     if not tokens:
         return []
 
-    # Build dynamic OR for ingredient name LIKE
     where_parts = []
-    params = {"limit": limit, "uid": user_id}  # ✅ DODANO uid
+    params = {"limit": limit, "uid": user_id}
     for idx, tok in enumerate(tokens[:8]):
         key = f"t{idx}"
         where_parts.append(f"i.name LIKE :{key}")
@@ -338,11 +372,11 @@ def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, user_id: i
     where_sql = " OR ".join(where_parts)
 
     sql = f"""
-        SELECT DISTINCT r.id, r.name, r.calories
+        SELECT DISTINCT r.id, r.name, r.calories, r.instructions
         FROM recipes r
         JOIN ingredient_recipe ir ON ir.recipe_id = r.id
         JOIN ingredients i ON i.id = ir.ingredient_id
-        WHERE r.user_id = :uid   -- ✅ DODANO
+        WHERE r.user_id = :uid
           AND ({where_sql})
         ORDER BY r.name
         LIMIT :limit
@@ -351,16 +385,149 @@ def find_recipes_by_ingredient_tokens(tokens: List[str], db: Session, user_id: i
     try:
         rows = db.execute(text(sql), params).fetchall()
         out = []
-        for rid, rname, rcal in rows:
+        for rid, rname, rcal, rinstructions in rows:
             out.append({
                 "id": int(rid),
                 "name": str(rname),
                 "calories": rcal,
-                "ingredients": get_ingredients_for_recipe(int(rid), db)
+                "ingredients": get_ingredients_for_recipe(int(rid), db),
+                "instructions": rinstructions
             })
         return out
     except Exception:
         return []
+
+
+# =========================
+# ✅ NOVO: AND logika (mora imati SVE tokene)
+# =========================
+
+def find_recipes_by_ingredient_tokens_all(tokens: List[str], db: Session, user_id: int, limit: int = 10) -> List[Dict]:
+    tokens = [t for t in (tokens or []) if t and len(t) > 2]
+    if not tokens:
+        return []
+
+    params = {"uid": user_id, "limit": limit}
+    where_parts = []
+    having_parts = []
+
+    for idx, tok in enumerate(tokens[:8]):
+        key = f"t{idx}"
+        params[key] = f"%{tok}%"
+        where_parts.append(f"i.name LIKE :{key}")
+        having_parts.append(f"SUM(CASE WHEN i.name LIKE :{key} THEN 1 ELSE 0 END) > 0")
+
+    where_sql = " OR ".join(where_parts)
+    having_sql = " AND ".join(having_parts)
+
+    sql = f"""
+        SELECT r.id, r.name, r.calories, r.instructions
+        FROM recipes r
+        JOIN ingredient_recipe ir ON ir.recipe_id = r.id
+        JOIN ingredients i ON i.id = ir.ingredient_id
+        WHERE r.user_id = :uid
+          AND ({where_sql})
+        GROUP BY r.id, r.name, r.calories, r.instructions
+        HAVING {having_sql}
+        ORDER BY r.name
+        LIMIT :limit
+    """
+
+    try:
+        rows = db.execute(text(sql), params).fetchall()
+        out = []
+        for rid, rname, rcal, rinstructions in rows:
+            out.append({
+                "id": int(rid),
+                "name": str(rname),
+                "calories": rcal,
+                "ingredients": get_ingredients_for_recipe(int(rid), db),
+                "instructions": rinstructions
+            })
+        return out
+    except Exception:
+        return []
+
+
+# =========================
+# ✅ NOVO: fallback "najbliži" recepti (2/3, 1/3)
+# =========================
+
+def find_recipes_by_ingredient_tokens_partial(tokens: List[str], db: Session, user_id: int, limit: int = 5) -> List[Dict]:
+    tokens = [t for t in (tokens or []) if t and len(t) > 2]
+    if not tokens:
+        return []
+
+    params = {"uid": user_id, "limit": limit}
+    where_parts = []
+    score_parts = []
+
+    for idx, tok in enumerate(tokens[:8]):
+        key = f"t{idx}"
+        params[key] = f"%{tok}%"
+        where_parts.append(f"i.name LIKE :{key}")
+        score_parts.append(f"SUM(CASE WHEN i.name LIKE :{key} THEN 1 ELSE 0 END)")
+
+    where_sql = " OR ".join(where_parts)
+    score_sql = " + ".join(score_parts)
+
+    sql = f"""
+        SELECT r.id, r.name, r.calories, r.instructions,
+               ({score_sql}) AS match_count
+        FROM recipes r
+        JOIN ingredient_recipe ir ON ir.recipe_id = r.id
+        JOIN ingredients i ON i.id = ir.ingredient_id
+        WHERE r.user_id = :uid
+          AND ({where_sql})
+        GROUP BY r.id, r.name, r.calories, r.instructions
+        ORDER BY match_count DESC, r.name ASC
+        LIMIT :limit
+    """
+
+    try:
+        rows = db.execute(text(sql), params).fetchall()
+        out = []
+        for rid, rname, rcal, rinstructions, match_count in rows:
+            out.append({
+                "id": int(rid),
+                "name": str(rname),
+                "calories": rcal,
+                "ingredients": get_ingredients_for_recipe(int(rid), db),
+                "instructions": rinstructions,
+                "match_count": int(match_count) if match_count is not None else 0
+            })
+        return out
+    except Exception:
+        return []
+
+
+# =========================
+# ✅ NOVO: Find recipes under calories (user only)
+# =========================
+
+def find_recipes_under_calories(db: Session, user_id: int, max_calories: int, limit: int = 10) -> List[Dict]:
+    if not max_calories or max_calories <= 0:
+        return []
+
+    results = (
+        db.query(Recipe)
+        .filter(Recipe.user_id == user_id)
+        .filter(Recipe.calories <= max_calories)
+        .order_by(Recipe.calories.asc(), Recipe.name.asc())
+        .limit(limit)
+        .all()
+    )
+
+    out = []
+    for r in results:
+        out.append({
+            "id": r.id,
+            "name": r.name,
+            "calories": getattr(r, "calories", None),
+            "ingredients": get_ingredients_for_recipe(r.id, db),
+            "instructions": getattr(r, "instructions", None),
+        })
+    return out
 
 
 # =========================
@@ -401,18 +568,12 @@ def build_diet_advice(flags: Dict[str, bool]) -> str:
     if flags.get("gluten_free"):
         lines.append("• Bez glutena: biraj rižu, krumpir, kukuruz, povrće, meso, jaja; pazi na kruh/tjesteninu.")
     if flags.get("vegan"):
-        lines.append("• Veganski: mahunarke, tofu, povrće, orašasti plodovi; dodaj izvor proteina u obrok.")
+        lines.append("• Veganski: mahunarke, tofu, povrće, orašaste plodove; dodaj izvor proteina u obrok.")
     if not lines:
         return ""
     return "Evo preporuka:\n" + "\n".join(lines)
 
-# ✅ DODANO: user_id param, i prosljeđivanje u find_recipes_in_db
 def build_meal_ideas(meal_type: str, db: Session, user_id: int) -> str:
-    """
-    Tries to propose recipes from DB (if exist), otherwise gives generic ideas.
-    Uses ONLY recipes of logged-in user.
-    """
-    # Try DB-known demo words
     candidates = {
         "doručak": ["kajgana", "omlet", "zob", "palačinke", "palacinke"],
         "ručak": ["pileća", "piletina", "salata", "pizza", "tjestenina", "rucak"],
@@ -426,7 +587,7 @@ def build_meal_ideas(meal_type: str, db: Session, user_id: int) -> str:
         if len(found) >= 3:
             break
         try:
-            res = find_recipes_in_db(term, db, user_id=user_id, limit=3)  # ✅ DODANO user_id
+            res = find_recipes_in_db(term, db, user_id=user_id, limit=3)
             for r in res:
                 rid = r.get("id")
                 if rid and rid not in seen_ids:
@@ -440,14 +601,9 @@ def build_meal_ideas(meal_type: str, db: Session, user_id: int) -> str:
     if found:
         out = f"Ideje za {meal_type} (iz baze):\n"
         for r in found:
-            kcal = f" ({r['calories']} kcal)" if r.get("calories") is not None else ""
-            if r.get("ingredients"):
-                out += f"🔹 {r['name']}{kcal}\n   Sastojci: {r['ingredients']}\n"
-            else:
-                out += f"🔹 {r['name']}{kcal}\n"
+            out += format_recipe_block(r)
         return out
 
-    # Generic fallback
     if meal_type == "doručak":
         return "Za doručak: kajgana/omlet, zobene pahuljice ili smoothie (ovisno što voliš)."
     if meal_type == "ručak":
@@ -482,11 +638,9 @@ def build_health_answer(food: str) -> str:
 # Chat Logic
 # =========================
 
-# ✅ DODANO: user_id param i prosljeđivanje dalje (ništa se ne briše)
 def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
     q = normalize_text(query)
 
-    # 0) "što sve možeš" (meta)
     if any(x in q for x in ["što sve možeš", "sta sve mozes", "što možeš", "sta mozes", "kako mi možeš pomoći", "kako mi mozes pomoci"]):
         return (
             "Mogu ti pomoći ovako:\n"
@@ -499,84 +653,92 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
             "• Odgovor na 'je li X zdravo'"
         )
 
-    # 1) dijeta/kalorije/bez šećera/bez glutena/veganski
     flags = detect_diet_flags(q)
     diet_text = build_diet_advice(flags)
-    # ako je korisnik pitao nešto u tom kontekstu, odgovori odmah
+
     if diet_text and any(x in q for x in ["što da jedem", "sta da jedem", "preporuči", "preporuci", "ideja", "što skuhati", "sta skuhati", "doruč", "doruc", "ruč", "ruc", "večer", "vecer"]):
-        # plus meal idea if meal type present
         meal_type = detect_meal_type(q)
         if meal_type:
-            return diet_text + "\n\n" + build_meal_ideas(meal_type, db, user_id=user_id)  # ✅ DODANO user_id
+            return diet_text + "\n\n" + build_meal_ideas(meal_type, db, user_id=user_id)
         return diet_text
 
-    # 2) greeting
     if any(x in q for x in ["bok", "pozdrav", "zdravo", "hej", "dobar dan", "dobro jutro", "dobra večer", "dobra vecer"]):
         return "Tu sam! Probaj: 'zamjena za mlijeko', 'ideja za večeru', 'imam piletinu i jaja', ili 'možeš li mi napisati recept pizza'."
 
-    # 3) thanks
     if any(x in q for x in ["hvala", "super", "odlično", "odlicno", "bravo", "top"]):
         return "Nema na čemu! 😊"
 
-    # 4) zdravlje pitanja: "je li X zdravo"
     if ("zdrav" in q) and ("je li" in q or "jel" in q):
         food = extract_health_food(q)
         return build_health_answer(food)
 
-    # 5) ideje za obrok (doručak/ručak/večera)
     meal_type = detect_meal_type(q)
-    if meal_type and (is_idea_question(q) or "za " in q or "ideja" in q):
-        # ako i dijeta flag postoji, dodaj i to
-        if diet_text:
-            return diet_text + "\n\n" + build_meal_ideas(meal_type, db, user_id=user_id)  # ✅ DODANO user_id
-        return build_meal_ideas(meal_type, db, user_id=user_id)  # ✅ DODANO user_id
+    max_cal = extract_max_calories(q)
 
-    # 6) "imam ..." -> preporuči po sastojcima (JOIN)
+    if meal_type and (is_idea_question(q) or "za " in q or "ideja" in q or max_cal is not None):
+        if max_cal is not None:
+            recipes = find_recipes_under_calories(db, user_id=user_id, max_calories=max_cal, limit=10)
+            if recipes:
+                out = f"Prijedlozi za {meal_type} do {max_cal} kcal (iz tvoje baze):\n"
+                for r in recipes:
+                    out += format_recipe_block(r)
+                return out
+            return f"Nemam recepte u tvojoj bazi do {max_cal} kcal. Dodaj još recepata ili povećaj limit."
+
+        if diet_text:
+            return diet_text + "\n\n" + build_meal_ideas(meal_type, db, user_id=user_id)
+        return build_meal_ideas(meal_type, db, user_id=user_id)
+
+    # =========================
+    # ✅ NOVO: "imam ..." AND + fallback (NA TVOJ KOD)
+    # =========================
     if "imam" in q:
         toks = extract_ingredients_after_imam(q)
-        recipes = find_recipes_by_ingredient_tokens(toks, db, user_id=user_id, limit=3)  # ✅ DODANO user_id
-        if recipes:
-            out = "Na temelju sastojaka koje imaš, možeš napraviti:\n"
-            for r in recipes:
-                kcal = f" ({r['calories']} kcal)" if r.get("calories") is not None else ""
-                if r.get("ingredients"):
-                    out += f"🔹 {r['name']}{kcal}\n   Sastojci: {r['ingredients']}\n"
-                else:
-                    out += f"🔹 {r['name']}{kcal}\n"
-            return out
-        # fallback bez baze
-        if toks:
-            return f"Imam zapisano da imaš: {', '.join(toks)}. Ako želiš recept iz baze, napiši 'recept <naziv>'."
-        return "Napiši što imaš (npr. 'imam piletinu i jaja') pa ću predložiti recepte."
 
-    # 7) recipe intent ANYWHERE in sentence
+        if not toks:
+            return "Napiši što imaš (npr. 'imam piletinu i jaja') pa ću predložiti recepte."
+
+        # 1) AND: mora imati SVE
+        recipes_all = find_recipes_by_ingredient_tokens_all(toks, db, user_id=user_id, limit=10)
+        if recipes_all:
+            out = "Na temelju sastojaka koje imaš, možeš napraviti:\n"
+            for r in recipes_all:
+                out += format_recipe_block(r)
+            return out
+
+        # 2) fallback: najbliže
+        partial = find_recipes_by_ingredient_tokens_partial(toks, db, user_id=user_id, limit=5)
+        if partial:
+            out = f"Nemam recept koji sadrži SVA ova {len(toks)} sastojka: {', '.join(toks)}.\n"
+            out += "Ali imam najbliže recepte koji sadrže neke od tih sastojaka:\n"
+            for r in partial:
+                mc = r.get("match_count", 0)
+                out += f"(poklapanje {mc}/{len(toks)})\n"
+                out += format_recipe_block(r)
+            return out
+
+        return f"Nemam recepte koji odgovaraju sastojcima: {', '.join(toks)}. Probaj drugačije nazive ili dodaj recepte u bazu."
+
     if "recept" in q:
         term = extract_recipe_from_sentence(q)
         if not term:
             term = _clean_recipe_query(q)
 
-        recipes = find_recipes_in_db(term, db, user_id=user_id, limit=3)  # ✅ DODANO user_id
+        recipes = find_recipes_in_db(term, db, user_id=user_id, limit=3)
         if recipes:
             out = "Evo što imam u bazi:\n"
             for r in recipes:
-                kcal = f" ({r['calories']} kcal)" if r.get("calories") is not None else ""
-                if r.get("ingredients"):
-                    out += f"🔹 {r['name']}{kcal}\n   Sastojci: {r['ingredients']}\n"
-                else:
-                    out += f"🔹 {r['name']}{kcal}\n"
+                out += format_recipe_block(r)
             return out
 
-        # ✅ DODANO: poruka kad korisnik nema taj recept (ne traži tuđe)
         return "Nemate taj recept u svojoj bazi. Dodajte ga u svoje recepte ili napišite naziv nekog svog recepta."
 
-    # 8) "što da jedem" bez meal type -> generički + (ako dijeta postoji već gore bi ušlo)
     if is_idea_question(q):
         return (
             "Reci mi je li to doručak, ručak ili večera 🙂\n"
             "Primjer: 'što da jedem za večeru' ili 'ideja za doručak'."
         )
 
-    # fallback
     return "Tu sam! Probaj: 'zamjena za mlijeko', 'ideja za večeru', 'imam piletinu i jaja', ili 'možeš li mi napisati recept pizza'."
 
 
@@ -590,14 +752,12 @@ async def handle_websocket_message(websocket: WebSocket, user_id: str, message: 
 
     db = get_db_session()
     try:
-        # ✅ DODANO: pretvori user_id iz URL-a u int da ide u DB filtere
         try:
             uid = int(user_id)
         except Exception:
             uid = 0
 
         if message_type == "chat":
-            # 1) substitution inside chat
             ing = extract_ingredient_from_text(content)
             if ing:
                 subs = get_ingredient_substitutions(ing)
@@ -608,7 +768,6 @@ async def handle_websocket_message(websocket: WebSocket, user_id: str, message: 
                 }), websocket)
                 return
 
-            # 2) only ingredient word -> treat as substitution (simple list)
             only_word = normalize_text(content)
             if only_word in ["mlijeko","mlijeka","maslac","šećer","secer","jaje","jaja","brašno","brasno","milk","butter","sugar","egg","flour"]:
                 subs = get_ingredient_substitutions(only_word)
@@ -619,8 +778,7 @@ async def handle_websocket_message(websocket: WebSocket, user_id: str, message: 
                 }), websocket)
                 return
 
-            # 3) normal response
-            response = get_cooking_tip(content, db, user_id=uid)  # ✅ DODANO user_id
+            response = get_cooking_tip(content, db, user_id=uid)
             await manager.send_personal_message(json.dumps({
                 "type": "response",
                 "content": response
