@@ -1,7 +1,7 @@
 """
 Database connection and models for SmartMeal AI
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, DateTime, ForeignKey, Table
+from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, DateTime, ForeignKey, Table, Text  # ✅ DODANO Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import os
@@ -71,6 +71,10 @@ class Recipe(Base):
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
 
     name = Column(String(255))
+
+    # ✅ NOVO: opis/upute recepta (mora postojati u MySQL tablici recipes)
+    instructions = Column(Text, nullable=True)  # ✅ DODANO
+
     calories = Column(Integer)
     protein = Column(Integer)
     carbs = Column(Integer)
