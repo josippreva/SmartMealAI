@@ -1,119 +1,195 @@
 """
 Database connection and models for SmartMeal AI
+- Supports MySQL (default) and SQLite (optional)
+- SQLAlchemy ORM models: User, Recipe, Ingredient, Meal
+- Many-to-many: Recipe <-> Ingredient via ingredient_recipe
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, DateTime, ForeignKey, Table, Text  # ✅ DODANO Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+
+from __future__ import annotations
+
 import os
 from dotenv import load_dotenv
 
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    JSON,
+    DateTime,
+    ForeignKey,
+    Table,
+    Text,
+)
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+
 load_dotenv()
 
-# Database configuration
-DB_TYPE = os.getenv("DB_TYPE", "mysql")  # MySQL je default
+# =========================
+# Config
+# =========================
+
+DB_TYPE = os.getenv("DB_TYPE", "mysql").strip().lower()  # mysql | sqlite
+
+# SQLite path (relative to this file) if DB_TYPE=sqlite
 DB_PATH = os.getenv("DB_PATH", "../smartmeal/database/database.sqlite")
 
-# Create database URL
-if DB_TYPE == "sqlite":
-    import pathlib
-    db_file = pathlib.Path(__file__).parent / DB_PATH
-    DATABASE_URL = f"sqlite:///{db_file}"
-else:
-    DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-    DB_PORT = os.getenv("DB_PORT", "3306")
-    DB_DATABASE = os.getenv("DB_DATABASE", "smartmeal")
-    DB_USERNAME = os.getenv("DB_USERNAME", "root")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-    DATABASE_URL = f"mysql+pymysql://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_DATABASE}"
+# MySQL settings (if DB_TYPE != sqlite)
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_DATABASE = os.getenv("DB_DATABASE", "smartmeal")
+DB_USERNAME = os.getenv("DB_USERNAME", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+DEBUG_DB_URL = os.getenv("DEBUG_DB_URL", "0") == "1"
+
 Base = declarative_base()
 
-# Association table for recipe-ingredient many-to-many relationship
+# =========================
+# Database URL + Engine
+# =========================
+
+def _build_database_url() -> str:
+    if DB_TYPE == "sqlite":
+        import pathlib
+        db_file = (pathlib.Path(__file__).parent / DB_PATH).resolve()
+        return f"sqlite:///{db_file}"
+    # MySQL (PyMySQL driver)
+    return f"mysql+pymysql://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_DATABASE}"
+
+DATABASE_URL = _build_database_url()
+
+engine_kwargs = {}
+
+if DB_TYPE == "sqlite":
+    # SQLite threading fix for FastAPI
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    # MySQL pooling (stabilnije u APIju)
+    engine_kwargs["pool_pre_ping"] = True
+    engine_kwargs["pool_recycle"] = int(os.getenv("DB_POOL_RECYCLE", "1800"))  # seconds
+    engine_kwargs["pool_size"] = int(os.getenv("DB_POOL_SIZE", "5"))
+    engine_kwargs["max_overflow"] = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+
+engine = create_engine(DATABASE_URL, echo=False, future=True, **engine_kwargs)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
+
+if DEBUG_DB_URL:
+    # Nemoj u produkciji, jer može ispisati password
+    print("DATABASE_URL =", DATABASE_URL)
+
+# =========================
+# Association table (many-to-many)
+# =========================
+
 ingredient_recipe = Table(
-    'ingredient_recipe',
+    "ingredient_recipe",
     Base.metadata,
-    Column('ingredient_id', Integer, ForeignKey('ingredients.id')),
-    Column('recipe_id', Integer, ForeignKey('recipes.id'))
+    Column("ingredient_id", Integer, ForeignKey("ingredients.id"), primary_key=True),
+    Column("recipe_id", Integer, ForeignKey("recipes.id"), primary_key=True),
 )
 
-# User model
+# =========================
+# Models
+# =========================
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255))
-    email = Column(String(255), unique=True, index=True)
-    goal = Column(String(255))
-    preferences = Column(JSON)
+
+    name = Column(String(255), nullable=True)
+    email = Column(String(255), unique=True, index=True, nullable=True)
+
+    goal = Column(String(255), nullable=True)
+
+    # preferences as JSON: npr. {"likes":["tuna"], "dislikes":["gljive"]} ili string list
+    preferences = Column(JSON, nullable=True)
+
     daily_calorie_target = Column(Integer, nullable=True)
     diet_type = Column(String(255), nullable=True)
     allergies = Column(JSON, nullable=True)
     available_ingredients = Column(JSON, nullable=True)
+
     age = Column(Integer, nullable=True)
     gender = Column(String(50), nullable=True)
     weight = Column(Float, nullable=True)
     height = Column(Float, nullable=True)
     activity_level = Column(String(50), nullable=True)
 
-    meals = relationship("Meal", back_populates="user")
-    recipes = relationship("Recipe", back_populates="user")  # ✅ NOVO
+    meals = relationship("Meal", back_populates="user", cascade="all, delete-orphan")
+    recipes = relationship("Recipe", back_populates="user", cascade="all, delete-orphan")
 
 
-# Recipe model
 class Recipe(Base):
     __tablename__ = "recipes"
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # ✅ NOVO: user_id da možemo filtrirati “samo moje recepte”
+    # filtriranje po useru (tvoji recepti)
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
 
-    name = Column(String(255))
+    name = Column(String(255), nullable=False)
+    instructions = Column(Text, nullable=True)
 
-    # ✅ NOVO: opis/upute recepta (mora postojati u MySQL tablici recipes)
-    instructions = Column(Text, nullable=True)  # ✅ DODANO
+    calories = Column(Integer, nullable=True)
+    protein = Column(Integer, nullable=True)
+    carbs = Column(Integer, nullable=True)
+    fat = Column(Integer, nullable=True)
+    prep_time = Column(Integer, nullable=True)
 
-    calories = Column(Integer)
-    protein = Column(Integer)
-    carbs = Column(Integer)
-    fat = Column(Integer)
-    prep_time = Column(Integer)
+    user = relationship("User", back_populates="recipes")
 
-    # Relationships
-    user = relationship("User", back_populates="recipes")  # ✅ NOVO
-    ingredients = relationship("Ingredient", secondary=ingredient_recipe, back_populates="recipes")
-    meals = relationship("Meal", back_populates="recipe")
+    ingredients = relationship(
+        "Ingredient",
+        secondary=ingredient_recipe,
+        back_populates="recipes",
+        lazy="selectin",  # važan performance win (eager-ish)
+    )
+
+    meals = relationship("Meal", back_populates="recipe", cascade="all, delete-orphan")
 
 
-# Ingredient model
 class Ingredient(Base):
     __tablename__ = "ingredients"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255))
+
+    name = Column(String(255), nullable=False, index=True)
+
     calories_per_100g = Column(Float, nullable=True)
     protein_per_100g = Column(Float, nullable=True)
     carbs_per_100g = Column(Float, nullable=True)
     fat_per_100g = Column(Float, nullable=True)
 
-    recipes = relationship("Recipe", secondary=ingredient_recipe, back_populates="ingredients")
+    recipes = relationship(
+        "Recipe",
+        secondary=ingredient_recipe,
+        back_populates="ingredients",
+        lazy="selectin",
+    )
 
 
-# Meal model
 class Meal(Base):
     __tablename__ = "meals"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    recipe_id = Column(Integer, ForeignKey("recipes.id"))
-    date = Column(DateTime)
-    meal_type = Column(String(50))
+
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    recipe_id = Column(Integer, ForeignKey("recipes.id"), index=True, nullable=False)
+
+    date = Column(DateTime, nullable=True)
+    meal_type = Column(String(50), nullable=True)
 
     user = relationship("User", back_populates="meals")
     recipe = relationship("Recipe", back_populates="meals")
 
+
+# =========================
+# FastAPI dependency
+# =========================
 
 def get_db():
     db = SessionLocal()
@@ -122,4 +198,7 @@ def get_db():
     finally:
         db.close()
 
-print("DATABASE_URL =", DATABASE_URL)
+
+# Optional helper (ako želiš ručno kreirati tablice)
+def init_db():
+    Base.metadata.create_all(bind=engine)
