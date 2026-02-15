@@ -1,40 +1,44 @@
-"""
-SmartMeal AI - Advanced Recommendation Engine
-Includes: Content-based filtering, Collaborative filtering, Calorie calculation, WebSocket AI Assistant
-"""
+from __future__ import annotations
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sqlalchemy.orm import Session
-from database import get_db, User, Recipe, Meal, Ingredient
-from datetime import datetime, timedelta
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import text
 import os
 import json
 from dotenv import load_dotenv
+
+from database import get_db, Recipe, Meal  # User, Ingredient možeš dodati ako ti treba
 from websocket_assistant import manager, handle_websocket_message
+from nlp_hr import normalize_hr, strip_accents
 
 load_dotenv()
 
-app = FastAPI(title="SmartMeal AI API", version="2.0.0")
+app = FastAPI(title="SmartMeal AI API", version="2.1.0")
 
-# CORS middleware
+# =========================
+# CORS
+# =========================
+# IMPORTANT: ako koristiš cookies/auth, stavi konkretne domene.
+# Za demo može ovako, ali nemoj u produkciji ostaviti "*" + credentials=True.
+ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================
+# =========================
 # Pydantic Models
-# ============================================
-
+# =========================
 class UserInput(BaseModel):
     user_id: Optional[int] = None
     age: int
@@ -45,33 +49,27 @@ class UserInput(BaseModel):
     preferences: str
     goals: dict  # {"type": "weight_loss", "target_calories": 1800}
     inventory: list  # dostupne namirnice
-    diet_type: Optional[str] = None  # vegan, vegetarian, keto, etc.
+    diet_type: Optional[str] = None
     allergies: Optional[List[str]] = []
 
+
 class RecommendationResponse(BaseModel):
-    recommendations: List[Dict]
+    recommendations: List[Dict[str, Any]]
     daily_calorie_target: int
     macros: Dict[str, float]
     explanation: str
 
-# ============================================
-# Helper Functions - Calorie Calculation
-# ============================================
 
+# =========================
+# Calorie / Macro Helpers
+# =========================
 def calculate_bmr(age: int, gender: str, weight: float, height: float) -> float:
-    """
-    Calculate Basal Metabolic Rate using Mifflin-St Jeor Equation
-    """
     if gender.lower() == "male":
-        bmr = (10 * weight) + (6.25 * height) - (5 * age) + 5
-    else:
-        bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
-    return bmr
+        return (10 * weight) + (6.25 * height) - (5 * age) + 5
+    return (10 * weight) + (6.25 * height) - (5 * age) - 161
+
 
 def calculate_tdee(bmr: float, activity_level: str) -> float:
-    """
-    Calculate Total Daily Energy Expenditure
-    """
     activity_multipliers = {
         "sedentary": 1.2,
         "light": 1.375,
@@ -79,158 +77,161 @@ def calculate_tdee(bmr: float, activity_level: str) -> float:
         "active": 1.725,
         "very_active": 1.9
     }
-    multiplier = activity_multipliers.get(activity_level.lower(), 1.2)
-    return bmr * multiplier
+    mult = activity_multipliers.get(activity_level.lower(), 1.2)
+    return bmr * mult
 
-def calculate_calorie_target(age: int, gender: str, weight: float, height: float,
-                            activity_level: str, goal_type: str) -> int:
-    """
-    Calculate daily calorie target based on user goals
-    """
+
+def calculate_calorie_target(
+    age: int,
+    gender: str,
+    weight: float,
+    height: float,
+    activity_level: str,
+    goal_type: str
+) -> int:
     bmr = calculate_bmr(age, gender, weight, height)
     tdee = calculate_tdee(bmr, activity_level)
 
-    # Adjust based on goal
     if goal_type == "weight_loss":
-        target = tdee - 500  # 500 calorie deficit
+        target = tdee - 500
     elif goal_type == "muscle_gain":
-        target = tdee + 300  # 300 calorie surplus
-    else:  # maintenance
+        target = tdee + 300
+    else:
         target = tdee
 
-    return int(target)
+    return max(1200, int(target))  # safety floor
+
 
 def calculate_macros(calorie_target: int, goal_type: str) -> Dict[str, float]:
-    """
-    Calculate macro distribution based on goal
-    """
     if goal_type == "weight_loss":
-        # High protein, moderate carbs, low fat
-        protein_ratio = 0.35
-        carbs_ratio = 0.40
-        fat_ratio = 0.25
+        protein_ratio, carbs_ratio, fat_ratio = 0.35, 0.40, 0.25
     elif goal_type == "muscle_gain":
-        # High protein, high carbs, moderate fat
-        protein_ratio = 0.30
-        carbs_ratio = 0.45
-        fat_ratio = 0.25
-    else:  # maintenance
-        # Balanced
-        protein_ratio = 0.25
-        carbs_ratio = 0.45
-        fat_ratio = 0.30
+        protein_ratio, carbs_ratio, fat_ratio = 0.30, 0.45, 0.25
+    else:
+        protein_ratio, carbs_ratio, fat_ratio = 0.25, 0.45, 0.30
 
     return {
-        "protein": (calorie_target * protein_ratio) / 4,  # 4 cal/g
-        "carbs": (calorie_target * carbs_ratio) / 4,     # 4 cal/g
-        "fat": (calorie_target * fat_ratio) / 9          # 9 cal/g
+        "protein": (calorie_target * protein_ratio) / 4,
+        "carbs": (calorie_target * carbs_ratio) / 4,
+        "fat": (calorie_target * fat_ratio) / 9
     }
 
-# ============================================
-# Content-Based Filtering
-# ============================================
 
-def content_based_filtering(recipes_df: pd.DataFrame, user_preferences: str,
-                           top_n: int = 10) -> pd.DataFrame:
-    """
-    Recommend recipes based on content similarity
-    """
+# =========================
+# Content-based filtering (HR-friendly)
+# =========================
+_TFIDF_CACHE: Dict[str, Any] = {
+    "vectorizer": None,
+    "recipe_matrix": None,
+    "recipe_ids": None,
+    "descriptions": None,
+}
+
+
+def _build_description(name: str, ingredients_text: str) -> str:
+    # HR normalizacija: ukloni dijakritiku za robusnost + lower
+    n = strip_accents(normalize_hr(name))
+    i = strip_accents(normalize_hr(ingredients_text))
+    return f"{n} {i}".strip()
+
+
+def content_based_filtering(
+    recipes_df: pd.DataFrame,
+    user_preferences: str,
+    top_n: int = 10
+) -> pd.DataFrame:
     if recipes_df.empty:
         return recipes_df
 
-    # Create recipe descriptions
-    recipes_df['description'] = recipes_df['name'].fillna('') + ' ' + \
-                                recipes_df.get('ingredients_text', '').fillna('')
+    # osiguraj column
+    if "ingredients_text" not in recipes_df.columns:
+        recipes_df["ingredients_text"] = ""
 
-    # TF-IDF vectorization
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=100)
+    # build descriptions
+    recipes_df["description"] = recipes_df.apply(
+        lambda r: _build_description(
+            str(r.get("name", "")),
+            str(r.get("ingredients_text", ""))
+        ),
+        axis=1
+    )
+
+    # vectorizer: bez english stopwords (HR)
+    vectorizer = TfidfVectorizer(max_features=500)
 
     try:
-        recipe_vectors = vectorizer.fit_transform(recipes_df['description'])
-        user_vector = vectorizer.transform([user_preferences])
-
-        # Calculate cosine similarity
-        similarities = cosine_similarity(user_vector, recipe_vectors).flatten()
-        recipes_df['content_score'] = similarities
+        recipe_vectors = vectorizer.fit_transform(recipes_df["description"])
+        user_vec = vectorizer.transform([_build_description(user_preferences, "")])
+        sims = cosine_similarity(user_vec, recipe_vectors).flatten()
+        recipes_df["content_score"] = sims
     except Exception:
-        recipes_df['content_score'] = 0.0
+        recipes_df["content_score"] = 0.0
 
-    return recipes_df.nlargest(top_n, 'content_score')
+    return recipes_df.nlargest(top_n, "content_score")
 
-# ============================================
-# Collaborative Filtering
-# ============================================
 
-def collaborative_filtering(user_id: int, recipes_df: pd.DataFrame,
-                           db: Session, top_n: int = 10) -> pd.DataFrame:
-    """
-    Recommend recipes based on similar users' preferences
-    """
+# =========================
+# Collaborative filtering
+# =========================
+def collaborative_filtering(user_id: int, recipes_df: pd.DataFrame, db: Session) -> pd.DataFrame:
     if recipes_df.empty or not user_id:
-        recipes_df['collab_score'] = 0.0
+        recipes_df["collab_score"] = 0.0
         return recipes_df
 
-    # Get user's meal history
     user_meals = db.query(Meal).filter(Meal.user_id == user_id).all()
-    user_recipe_ids = set([meal.recipe_id for meal in user_meals])
+    user_recipe_ids = {m.recipe_id for m in user_meals}
 
     if not user_recipe_ids:
-        recipes_df['collab_score'] = 0.0
+        recipes_df["collab_score"] = 0.0
         return recipes_df
 
-    # Find similar users (users who ate similar recipes)
     similar_users_meals = db.query(Meal).filter(
         Meal.recipe_id.in_(user_recipe_ids),
         Meal.user_id != user_id
     ).all()
 
-    # Count recipe popularity among similar users
-    recipe_counts = {}
+    recipe_counts: Dict[int, int] = {}
     for meal in similar_users_meals:
-        if meal.recipe_id not in user_recipe_ids:  # Don't recommend already eaten
+        if meal.recipe_id not in user_recipe_ids:
             recipe_counts[meal.recipe_id] = recipe_counts.get(meal.recipe_id, 0) + 1
 
-    # Add collaborative score
-    recipes_df['collab_score'] = recipes_df['id'].map(
-        lambda x: recipe_counts.get(x, 0)
-    )
+    recipes_df["collab_score"] = recipes_df["id"].map(lambda x: recipe_counts.get(int(x), 0))
 
-    # Normalize scores
-    if recipes_df['collab_score'].max() > 0:
-        recipes_df['collab_score'] = recipes_df['collab_score'] / recipes_df['collab_score'].max()
+    mx = float(recipes_df["collab_score"].max() or 0.0)
+    if mx > 0:
+        recipes_df["collab_score"] = recipes_df["collab_score"] / mx
+    else:
+        recipes_df["collab_score"] = 0.0
 
     return recipes_df
 
-# ============================================
-# Main Recommendation Endpoint
-# ============================================
 
+# =========================
+# Main Recommendation Endpoint
+# =========================
 @app.post("/recommend-meals/", response_model=RecommendationResponse)
 async def recommend_meals(user_input: UserInput, db: Session = Depends(get_db)):
-    """
-    Advanced meal recommendation system
-    """
     try:
-        # 1. Calculate calorie target
-        goal_type = user_input.goals.get("type", "maintenance")
+        goal_type = (user_input.goals or {}).get("type", "maintenance")
         calorie_target = calculate_calorie_target(
-            user_input.age, user_input.gender, user_input.weight,
-            user_input.height, user_input.activity_level, goal_type
+            user_input.age,
+            user_input.gender,
+            user_input.weight,
+            user_input.height,
+            user_input.activity_level,
+            goal_type
         )
-
-        # 2. Calculate macro targets
         macros = calculate_macros(calorie_target, goal_type)
 
-        # 3. Fetch recipes from database
-        recipes_query = db.query(Recipe).all()
+        # eager load ingredients to avoid N+1 (requires Recipe.ingredients relationship)
+        recipes_query = db.query(Recipe).options(selectinload(Recipe.ingredients)).all()
 
         if not recipes_query:
             raise HTTPException(status_code=404, detail="No recipes found in database")
 
-        # Convert to DataFrame
         recipes_data = []
         for recipe in recipes_query:
-            ingredients_text = " ".join([ing.name for ing in recipe.ingredients])
+            ingredients_text = " ".join([getattr(ing, "name", "") for ing in getattr(recipe, "ingredients", [])])
             recipes_data.append({
                 "id": recipe.id,
                 "name": recipe.name,
@@ -244,72 +245,85 @@ async def recommend_meals(user_input: UserInput, db: Session = Depends(get_db)):
 
         recipes_df = pd.DataFrame(recipes_data)
 
-        # 4. Filter by diet type
-        if user_input.diet_type:
-            # This would require additional filtering logic based on ingredients
-            pass
+        if recipes_df.empty:
+            raise HTTPException(status_code=404, detail="No recipes available after processing")
 
-        # 5. Filter by allergies
+        # allergies: substring match over ingredients list
         if user_input.allergies:
-            # Filter out recipes with allergens
+            allergies_norm = [strip_accents(normalize_hr(a)) for a in user_input.allergies if a]
+            keep_ids = []
+
             for recipe in recipes_query:
-                ingredient_names = [ing.name.lower() for ing in recipe.ingredients]
-                has_allergen = any(allergen.lower() in ingredient_names
-                                 for allergen in user_input.allergies)
-                if has_allergen:
-                    recipes_df = recipes_df[recipes_df['id'] != recipe.id]
+                ing_names = [strip_accents(normalize_hr(getattr(ing, "name", ""))) for ing in getattr(recipe, "ingredients", [])]
+                joined = " ".join(ing_names)
+                has_allergen = any(a in joined for a in allergies_norm)
 
-        # 6. Filter by available ingredients (if provided)
+                if not has_allergen:
+                    keep_ids.append(recipe.id)
+
+            recipes_df = recipes_df[recipes_df["id"].isin(keep_ids)]
+
+        # inventory preference score
         if user_input.inventory:
-            inventory_lower = [item.lower() for item in user_input.inventory]
-            # Prefer recipes with available ingredients
-            recipes_df['has_ingredients'] = recipes_df['ingredients_text'].apply(
-                lambda x: sum(1 for item in inventory_lower if item in x.lower())
-            )
+            inv = [strip_accents(normalize_hr(x)) for x in user_input.inventory if x]
+
+            def inv_score(txt: str) -> int:
+                t = strip_accents(normalize_hr(txt))
+                return sum(1 for item in inv if item and item in t)
+
+            recipes_df["has_ingredients"] = recipes_df["ingredients_text"].apply(inv_score)
         else:
-            recipes_df['has_ingredients'] = 0
+            recipes_df["has_ingredients"] = 0
 
-        # 7. Filter by calorie target (±200 calories per meal)
-        meal_calorie_target = calorie_target / 3  # Assuming 3 meals per day
-        calorie_tolerance = 200
+        # calorie filtering per meal
+        meal_calorie_target = calorie_target / 3
+        tolerance = 200
 
-        # Only filter if we have recipes
-        if not recipes_df.empty:
-            filtered_df = recipes_df[
-                (recipes_df['calories'] >= meal_calorie_target - calorie_tolerance) &
-                (recipes_df['calories'] <= meal_calorie_target + calorie_tolerance)
-            ]
+        filtered_df = recipes_df[
+            (recipes_df["calories"] >= meal_calorie_target - tolerance) &
+            (recipes_df["calories"] <= meal_calorie_target + tolerance)
+        ]
 
-            # If filtering removes all recipes, keep original
-            if not filtered_df.empty:
-                recipes_df = filtered_df
+        if not filtered_df.empty:
+            recipes_df = filtered_df
 
-        # 8. Content-based filtering
-        recipes_df = content_based_filtering(recipes_df, user_input.preferences, top_n=20)
+        # content-based
+        recipes_df = content_based_filtering(recipes_df, user_input.preferences, top_n=50)
 
-        # 9. Collaborative filtering
+        # collaborative
         if user_input.user_id:
-            recipes_df = collaborative_filtering(user_input.user_id, recipes_df, db, top_n=20)
+            recipes_df = collaborative_filtering(user_input.user_id, recipes_df, db)
         else:
-            recipes_df['collab_score'] = 0.0
+            recipes_df["collab_score"] = 0.0
 
-        # 10. Calculate final score (weighted combination)
-        recipes_df['final_score'] = (
-            0.4 * recipes_df['content_score'] +
-            0.3 * recipes_df['collab_score'] +
-            0.2 * (recipes_df['has_ingredients'] / max(recipes_df['has_ingredients'].max(), 1)) +
-            0.1 * (1 - abs(recipes_df['calories'] - meal_calorie_target) / meal_calorie_target)
+        # final score (with safe clamp)
+        max_has = float(recipes_df["has_ingredients"].max() or 0.0)
+        if max_has <= 0:
+            max_has = 1.0
+
+        def calorie_closeness(cal: float) -> float:
+            if meal_calorie_target <= 0:
+                return 0.0
+            score = 1.0 - abs(float(cal) - float(meal_calorie_target)) / float(meal_calorie_target)
+            return max(0.0, min(1.0, score))
+
+        recipes_df["cal_score"] = recipes_df["calories"].apply(calorie_closeness)
+
+        recipes_df["final_score"] = (
+            0.45 * recipes_df.get("content_score", 0.0) +
+            0.30 * recipes_df.get("collab_score", 0.0) +
+            0.15 * (recipes_df["has_ingredients"] / max_has) +
+            0.10 * recipes_df["cal_score"]
         )
 
-        # 11. Sort and get top recommendations
-        top_recipes = recipes_df.nlargest(5, 'final_score')
+        top_recipes = recipes_df.nlargest(5, "final_score")
+        recommendations = top_recipes[["id", "name", "calories", "protein", "carbs", "fat", "prep_time"]].to_dict(orient="records")
 
-        # 12. Prepare response
-        recommendations = top_recipes[['id', 'name', 'calories', 'protein', 'carbs', 'fat', 'prep_time']].to_dict(orient='records')
-
-        explanation = f"Based on your {goal_type} goal, we recommend {len(recommendations)} meals. "
-        explanation += f"Your daily calorie target is {calorie_target} kcal. "
-        explanation += f"Target macros: {int(macros['protein'])}g protein, {int(macros['carbs'])}g carbs, {int(macros['fat'])}g fat."
+        explanation = (
+            f"Na temelju cilja '{goal_type}' preporučujem {len(recommendations)} obroka. "
+            f"Dnevni cilj: {calorie_target} kcal. "
+            f"Makroi: ~{int(macros['protein'])}g proteina, ~{int(macros['carbs'])}g UH, ~{int(macros['fat'])}g masti."
+        )
 
         return RecommendationResponse(
             recommendations=recommendations,
@@ -318,45 +332,37 @@ async def recommend_meals(user_input: UserInput, db: Session = Depends(get_db)):
             explanation=explanation
         )
 
+    except HTTPException:
+        # pusti FastAPI da vrati pravi status (npr. 404)
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating recommendations: {str(e)}")
 
-# ============================================
-# Health Check
-# ============================================
 
+# =========================
+# Health / root
+# =========================
 @app.get("/")
 async def root():
     return {
-        "message": "SmartMeal AI API v2.0",
+        "message": "SmartMeal AI API v2.1",
         "status": "running",
-        "endpoints": ["/recommend-meals/", "/health"]
+        "endpoints": ["/recommend-meals/", "/health", "/ws/assistant/{user_id}"]
     }
+
 
 @app.get("/health")
 async def health_check(db: Session = Depends(get_db)):
-    """
-    Check database connection and API health
-    """
     try:
-        from sqlalchemy import text
         db.execute(text("SELECT 1"))
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "version": "2.0.0"
-        }
+        return {"status": "healthy", "database": "connected", "version": "2.1.0"}
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e)
-        }
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
-# ============================================
-# WebSocket AI Assistant Endpoint
-# ============================================
 
+# =========================
+# WebSocket endpoint
+# =========================
 @app.websocket("/ws/assistant/{user_id}")
 async def websocket_assistant_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect(websocket, user_id)
@@ -365,36 +371,37 @@ async def websocket_assistant_endpoint(websocket: WebSocket, user_id: str):
         while True:
             data = await websocket.receive_text()
 
-            # NEW: safe JSON parsing
             try:
                 message = json.loads(data)
             except json.JSONDecodeError:
                 await websocket.send_text(json.dumps({
                     "type": "response",
-                    "content": "Neispravan format poruke."
+                    "content": "Neispravan format poruke (mora biti JSON)."
                 }))
                 continue
 
-            # NEW: protect handler so it doesn't kill the socket
             try:
                 await handle_websocket_message(websocket, user_id, message)
             except Exception as e:
                 print(f"AI assistant error for {user_id}: {e}")
                 await websocket.send_text(json.dumps({
                     "type": "response",
-                    "content": "Ups, došlo je do greške. Pokušaj ponovno za par sekundi."
+                    "content": "Ups, došlo je do greške. Pokušaj ponovno."
                 }))
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, user_id)
+        manager.disconnect(user_id)
         print(f"User {user_id} disconnected from AI assistant")
+
     except Exception as e:
-        manager.disconnect(websocket, user_id)
+        manager.disconnect(user_id)
         print(f"WebSocket fatal error for {user_id}: {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("API_PORT", 8001))
     host = os.getenv("API_HOST", "127.0.0.1")
+
     uvicorn.run(app, host=host, port=port, reload=True)

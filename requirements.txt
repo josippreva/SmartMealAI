@@ -10,3 +10,4 @@ openai==2.15.0
 pydantic==2.10.6
 python-multipart==0.0.20
 websockets==14.1
+rapidfuzz
