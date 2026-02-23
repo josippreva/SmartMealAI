@@ -1,21 +1,15 @@
 """
-WebSocket AI Chat Assistant for SmartMeal (Enhanced Version v2.1)
+WebSocket AI Chat Assistant for SmartMeal (Enhanced Version v2.2)
 
-NEW Features v2.1:
-✅ User goal integration (weight_loss, maintenance, muscle_gain)
-✅ Allergies filtering (automatski isključi recepte s alergenima)
-✅ Meal style detection: "nešto lagano", "brzo", "hranjivo", "zdravo"
-✅ Recipe search (fuzzy) from user's DB
-✅ Ingredient-based recipe search from user's DB (ALL + partial)
-✅ Low-cal suggestions: "večera do 300 kcal" -> shows ONLY 3 short recommendations
-✅ Selection flow: user picks 1/2/3 or name -> then cooking mode step-by-step
-✅ Pagination: "novo" / "još" -> next 3 suggestions
-✅ Substitutions: "zamjena za mlijeko", "nemam jaja"
-✅ Cooking mode: "krenimo kuhati <recept>" + dalje/nazad/ponovi/stop
-✅ Shopping list: "shopping lista za <recept>"
-✅ Day meal plan: "plan obroka za danas" / "plan do 1800 kcal"
-✅ Explanation: "zašto si ovo preporučio?"
-✅ Nutrition: "koliko kalorija ima <recept/sastojak>", "koliko proteina ima <recept/sastojak>"
+FIXES v2.2:
+✅ func.rand() umjesto func.random() (MySQL)
+✅ Fix ingredient_recipes -> raw SQL join (salata, tjestenina, juha)
+✅ Bolje mapiranje sastojaka (imam piletinu -> recepti s piletinom)
+✅ Parsiranje kalorija bez razmaka: "do 600kalorija"
+✅ "prijedlog za večeru", "prijedlog obroka" -> prepoznaje
+✅ Typo tolerancija: "zamijena" -> "zamjena", "dans" -> "danas"
+✅ Random ORDER BY rand() -> uvijek različiti prijedlozi
+✅ "još" paginacija radi ispravno
 """
 
 from __future__ import annotations
@@ -28,7 +22,7 @@ import time
 import datetime
 
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, text
+from sqlalchemy import or_, text, func
 
 from database import SessionLocal, Recipe, Ingredient
 
@@ -54,20 +48,17 @@ class ConnectionManager:
             "step": 0,
             "conversation_history": [],
 
-            # ✅ selection/pagination context
             "last_suggestions": [],
             "suggestion_cursor": 0,
-            "last_suggestion_mode": None,   # "low_cal" | "ingredients" | "plan" | "style"
+            "last_suggestion_mode": None,
             "last_meal_type": None,
             "last_max_cal": None,
             "last_style_filters": None,
 
-            # ✅ plan context
             "last_plan": None,
-            
-            # ✅ 🆕 user profile context
-            "user_goal": None,  # weight_loss, maintenance, muscle_gain
-            "user_allergies": [],  # lista alergena
+
+            "user_goal": None,
+            "user_allergies": [],
         })
 
     def disconnect(self, user_id: str):
@@ -95,33 +86,25 @@ def get_db_session() -> Session:
 
 
 # =========================
-# 🆕 USER PROFILE HELPERS
+# USER PROFILE HELPERS
 # =========================
 
 def get_user_profile_from_db(user_id: int, db: Session) -> Dict[str, Any]:
-    """
-    Dohvati user goal i allergies iz users tablice
-    """
     try:
-        # Alternativno, raw SQL:
         sql = "SELECT goal, allergies FROM users WHERE id = :uid LIMIT 1"
         row = db.execute(text(sql), {"uid": user_id}).fetchone()
-        
+
         if row:
             goal = row[0] if row[0] else None
             allergies_raw = row[1] if row[1] else None
-            
-            # 🆕 MySQL vraća JSON kao string, mora se parsirati
+
             if allergies_raw:
                 if isinstance(allergies_raw, str):
                     try:
-                        # Probaj parsirati kao JSON
                         allergies = json.loads(allergies_raw)
-                        # Ako je string u stringu, parsiraj opet
                         if isinstance(allergies, str):
                             allergies = json.loads(allergies)
-                    except:
-                        # Ako nije JSON, možda je comma-separated string
+                    except Exception:
                         allergies = [a.strip() for a in allergies_raw.split(',') if a.strip()]
                 elif isinstance(allergies_raw, list):
                     allergies = allergies_raw
@@ -129,49 +112,34 @@ def get_user_profile_from_db(user_id: int, db: Session) -> Dict[str, Any]:
                     allergies = []
             else:
                 allergies = []
-            
-            result = {
-                "goal": goal,
-                "allergies": allergies
-            }
-            
-            # 🆕 Debug log
+
             print(f"📊 DB Query result for user {user_id}:")
             print(f"   Raw allergies: {repr(allergies_raw)} (type: {type(allergies_raw)})")
             print(f"   Parsed allergies: {allergies}")
             print(f"   Goal: {goal}")
-            
-            return result
-        
+
+            return {"goal": goal, "allergies": allergies}
+
         return {"goal": None, "allergies": []}
-        
+
     except Exception as e:
         print(f"❌ Error fetching user profile: {e}")
         return {"goal": None, "allergies": []}
 
 
 def load_user_profile(user_id: int, db: Session) -> None:
-    """
-    Load user profile u context pri connect-u ili na zahtjev
-    """
     profile = get_user_profile_from_db(user_id, db)
     ctx = manager.user_contexts.get(str(user_id), {})
     ctx["user_goal"] = profile.get("goal")
     ctx["user_allergies"] = profile.get("allergies", [])
     manager.user_contexts[str(user_id)] = ctx
-    
-    # 🆕 Debug log
     print(f"✅ Loaded profile for user {user_id}: goal={profile.get('goal')}, allergies={profile.get('allergies', [])}")
 
 
 def filter_recipes_by_allergies(recipes: List[Dict[str, Any]], allergies: List[str], db: Session) -> List[Dict[str, Any]]:
-    """
-    Filtriraj recepte koji sadrže alergene
-    """
     if not allergies:
         return recipes
-    
-    # 🆕 Mapiraj engleski alergeni na hrvatske nazive
+
     allergen_mapping = {
         "eggs": ["jaja", "jaje", "egg"],
         "milk": ["mlijeko", "milk", "maslac", "sir", "jogurt", "vrhnje"],
@@ -183,38 +151,28 @@ def filter_recipes_by_allergies(recipes: List[Dict[str, Any]], allergies: List[s
         "shellfish": ["skoljka", "shellfish", "lignja", "kozica", "shrimp"],
         "sesame": ["sezam", "sesame"]
     }
-    
-    # 🆕 Debug
+
     print(f"🔍 Filtering {len(recipes)} recipes for allergies: {allergies}")
-    
-    # Prošireni alergen lista (uključuje i eng i hr nazive)
+
     expanded_allergens = []
     for allergen in allergies:
         allergen_lower = allergen.lower()
         expanded_allergens.append(allergen_lower)
-        
-        # Dodaj sve mapove za taj alergen
         if allergen_lower in allergen_mapping:
             expanded_allergens.extend(allergen_mapping[allergen_lower])
-    
-    # Normaliziraj alergene
+
     allergies_norm = [strip_accents(normalize_hr(a)) for a in expanded_allergens if a]
-    
     print(f"   Expanded allergens (normalized): {allergies_norm}")
-    
+
     if not allergies_norm:
         return recipes
-    
+
     safe_recipes = []
-    
     for recipe in recipes:
         recipe_id = recipe.get("id")
-        
-        # Dohvati sastojke recepta
         ingredients_text = recipe.get("ingredients", "")
-        
+
         if not ingredients_text:
-            # Ako nema ingredients_text, dohvati iz baze
             try:
                 sql = """
                     SELECT i.name
@@ -225,50 +183,33 @@ def filter_recipes_by_allergies(recipes: List[Dict[str, Any]], allergies: List[s
                 rows = db.execute(text(sql), {"rid": recipe_id}).fetchall()
                 ingredients_list = [r[0] for r in rows if r and r[0]]
                 ingredients_text = " ".join(ingredients_list)
-            except:
+            except Exception:
                 ingredients_text = ""
-        
-        # Normaliziraj sastojke
+
         ingredients_norm = strip_accents(normalize_hr(ingredients_text.lower()))
-        
-        # Provjeri da li sadrži alergene
         has_allergen = any(allergen in ingredients_norm for allergen in allergies_norm)
-        
+
         if not has_allergen:
             safe_recipes.append(recipe)
             print(f"   ✅ SAFE: {recipe.get('name')} - ingredients: {ingredients_text[:50]}")
         else:
-            # Debug log
             print(f"   ⚠️ FILTERED: {recipe.get('name')} - ingredients: {ingredients_text[:50]}")
-    
+
     print(f"   Result: {len(safe_recipes)}/{len(recipes)} recipes are safe")
-    
     return safe_recipes
 
 
 def adjust_calories_for_goal(base_calories: int, goal: Optional[str]) -> Tuple[int, int]:
-    """
-    Prilagodi kalorijske limite prema cilju korisnika
-    Vraća (min_cal, max_cal)
-    """
     if not goal or goal == "maintenance":
         return (base_calories - 200, base_calories + 200)
-    
     if goal == "weight_loss":
-        # Preference za niže kalorije
         return (max(200, base_calories - 300), base_calories)
-    
     if goal == "muscle_gain":
-        # Preference za više kalorija i proteina
         return (base_calories, base_calories + 300)
-    
     return (base_calories - 200, base_calories + 200)
 
 
 def get_goal_friendly_message(goal: Optional[str]) -> str:
-    """
-    Generiraj user-friendly poruku o cilju
-    """
     if goal == "weight_loss":
         return "🎯 Tvoj cilj: mršavljenje (preporučujem niže kalorije)"
     if goal == "muscle_gain":
@@ -286,6 +227,28 @@ _RE_KEEP_HR = re.compile(r"[^\wčćđšž\s]+", re.IGNORECASE)
 
 def _strip_punct_keep_hr(s: str) -> str:
     return _RE_KEEP_HR.sub(" ", (s or "")).strip()
+
+def normalize_typos(q: str) -> str:
+    """
+    ✅ FIX: Ispravi česte tipfelere prije obrade
+    """
+    replacements = [
+        # zamjena
+        (r"\bzamijen[a-zčćđšž]*\b", "zamjena"),
+        (r"\bzamjenu\b", "zamjena"),
+        # danas
+        (r"\bdans\b", "danas"),
+        (r"\bdanas\b", "danas"),
+        # kalorija bez razmaka: "600kalorija" -> "600 kalorija"
+        (r"(\d+)(kcal|kalorij[a-z]*)", r"\1 \2"),
+        # prijedlog
+        (r"\bprijedlo[gž]\b", "prijedlog"),
+        (r"\bprijedloz[i]?\b", "prijedlog"),
+    ]
+    result = q
+    for pattern, replacement in replacements:
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return result
 
 def detect_meal_type(q: str) -> Optional[str]:
     t = normalize_hr(q)
@@ -306,8 +269,28 @@ def meal_type_accusative(meal_type: str) -> str:
 
 def is_idea_question(q: str) -> bool:
     t = normalize_hr(q)
-    triggers = ["što da jedem", "sta da jedem", "što skuhati", "sta skuhati", "ideja", "preporuči", "preporuci"]
+    triggers = [
+        "što da jedem", "sta da jedem", "što skuhati", "sta skuhati",
+        "ideja", "preporuči", "preporuci",
+        # ✅ FIX: prijedlog za večeru / prijedlog obroka
+        "prijedlog za", "prijedlog obroka", "prijedlozi za",
+        "što za večeru", "sta za veceru", "što za ručak", "što za doručak",
+        "što jesti", "sta jesti",
+    ]
     return any(x in t for x in triggers)
+
+def extract_meal_type_from_idea(q: str) -> Optional[str]:
+    """
+    ✅ FIX: Izvuci meal type iz "prijedlog za večeru" i slično
+    """
+    t = normalize_hr(q)
+    if "večer" in t or "vecer" in t:
+        return "večera"
+    if "ruč" in t or "ruc" in t:
+        return "ručak"
+    if "doruč" in t or "doruc" in t:
+        return "doručak"
+    return None
 
 def extract_health_food(text_msg: str) -> str:
     t = normalize_hr(text_msg).replace("jel", "je li")
@@ -322,12 +305,16 @@ def extract_health_food(text_msg: str) -> str:
 
 def extract_max_calories(text_msg: str) -> Optional[int]:
     t = normalize_hr(text_msg)
+    # ✅ FIX: normalize typos first (600kalorija -> 600 kalorija)
+    t = normalize_typos(t)
     patterns = [
-        r"\bdo\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+        r"\bdo\s+(\d{2,5})\s*(kcal|kalorija|kalorije|kalorija)?\b",
         r"\bmax(?:imum)?\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
         r"\bispod\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
         r"\bmanje\s+od\s+(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
         r"\b<=\s*(\d{2,5})\s*(kcal|kalorija|kalorije)?\b",
+        # ✅ FIX: bez razmaka "do600kcal"
+        r"\bdo(\d{2,5})(kcal|kalorija|kalorije)?\b",
     ]
     for p in patterns:
         m = re.search(p, t)
@@ -342,6 +329,8 @@ def extract_max_calories(text_msg: str) -> Optional[int]:
 
 def extract_ingredient_from_text(text_msg: str) -> Optional[str]:
     t = normalize_hr(text_msg)
+    # ✅ FIX: prihvati i typo "zamijena"
+    t = re.sub(r"\bzamijen[a-zčćđšž]*\b", "zamjena", t)
     patterns = [
         r"zamjen[a-zčćđšž]*\s+za\s+(.+)$",
         r"što\s+umjesto\s+(.+)$",
@@ -390,6 +379,7 @@ def extract_ingredients_after_imam(text_msg: str) -> str:
 
 def extract_plan_target_kcal(text_msg: str) -> Optional[int]:
     t = normalize_hr(text_msg)
+    t = normalize_typos(t)
     m = re.search(r"\bplan\b.*?\b(\d{3,5})\s*(kcal|kalorija|kalorije)?\b", t)
     if m:
         try:
@@ -402,8 +392,12 @@ def extract_plan_target_kcal(text_msg: str) -> Optional[int]:
 
 def wants_day_plan(q: str) -> bool:
     t = normalize_hr(q)
+    # ✅ FIX: uključi typo "dans"
+    t = normalize_typos(t)
     return any(x in t for x in [
-        "plan obroka", "plan za danas", "plan za sutra", "dnevni plan", "meal plan", "plan prehrane"
+        "plan obroka", "plan za danas", "plan za sutra", "dnevni plan",
+        "meal plan", "plan prehrane", "obroci za danas", "što jesti danas",
+        "sta jesti danas",
     ])
 
 
@@ -414,68 +408,91 @@ def wants_day_plan(q: str) -> bool:
 def detect_meal_style(q: str) -> Dict[str, Any]:
     t = normalize_hr(q)
     filters: Dict[str, Any] = {}
-    
+
     if any(x in t for x in ["brz", "hitno", "nemam vrem", "malo vrem", "kratko", "10 min", "20 min", "30 min"]):
         filters["max_prep_time"] = 30
         filters["style_tag"] = "brzo"
-    
+
     if any(x in t for x in ["lagan", "lagano", "light", "osvjež", "osvježavajuć", "lake", "lako probavljiv"]):
         filters["max_calories"] = 400
         filters["style"] = "light"
         filters["style_tag"] = "lagano"
-    
+
     if any(x in t for x in ["hranjiv", "sočn", "syt", "zasit", "zasitn", "masn"]):
         filters["min_protein"] = 20
         filters["style"] = "hearty"
         filters["style_tag"] = "hranjivo"
-    
+
     if any(x in t for x in ["zdrav", "fit", "clean", "nutritvn", "balanced", "uravnotež"]):
         filters["healthy"] = True
         filters["max_calories"] = 500
         filters["style_tag"] = "zdravo"
-    
+
     if any(x in t for x in ["tjestenin", "pasta", "spageti", "makaroni"]):
         filters["contains_ingredient"] = "tjestenina"
         filters["style_tag"] = "tjestenina"
-    
+
     if any(x in t for x in ["salat"]):
         filters["contains_ingredient"] = "salata"
         filters["style_tag"] = "salata"
-    
+
     if any(x in t for x in ["juha", "juh", "čorb", "corb", "supa"]):
-        filters["recipe_type"] = "soup"
+        filters["recipe_name_like"] = "juh"
         filters["style_tag"] = "juha"
-    
+
     if any(x in t for x in ["protein", "meso", "pilet", "riba", "tunj"]):
         filters["min_protein"] = 25
-    
+
     return filters
 
 
 def find_recipes_by_style(db: Session, user_id: int, style_filters: Dict[str, Any], limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
     query = db.query(Recipe).filter(Recipe.user_id == user_id)
-    
+
     if "max_calories" in style_filters:
         query = query.filter(Recipe.calories <= style_filters["max_calories"])
-    
+
     if "min_protein" in style_filters:
         if hasattr(Recipe, 'protein'):
             query = query.filter(Recipe.protein >= style_filters["min_protein"])
-    
+
     if "max_prep_time" in style_filters:
         if hasattr(Recipe, 'prep_time'):
             query = query.filter(Recipe.prep_time <= style_filters["max_prep_time"])
-    
+
+    # ✅ FIX: recipe name like umjesto ingredient join (za juhu)
+    if "recipe_name_like" in style_filters:
+        query = query.filter(Recipe.name.like(f"%{style_filters['recipe_name_like']}%"))
+
+    # ✅ FIX: contains_ingredient koristimo raw SQL join, ne Recipe.ingredient_recipes
     if "contains_ingredient" in style_filters:
         ingredient_name = style_filters["contains_ingredient"]
-        query = (
-            query.join(Recipe.ingredient_recipes)
-            .join(Ingredient)
-            .filter(Ingredient.name.like(f"%{ingredient_name}%"))
-        )
-    
-    results = query.order_by(Recipe.name).offset(offset).limit(limit).all()
-    
+        recipe_ids_sql = text("""
+            SELECT DISTINCT ir.recipe_id
+            FROM ingredient_recipe ir
+            JOIN ingredients i ON i.id = ir.ingredient_id
+            WHERE i.name LIKE :ing_name
+              AND ir.recipe_id IN (
+                  SELECT id FROM recipes WHERE user_id = :uid
+              )
+        """)
+        try:
+            rows = db.execute(recipe_ids_sql, {
+                "ing_name": f"%{ingredient_name}%",
+                "uid": user_id
+            }).fetchall()
+            ids = [r[0] for r in rows if r]
+            if ids:
+                query = query.filter(Recipe.id.in_(ids))
+            else:
+                return []
+        except Exception as e:
+            print(f"❌ contains_ingredient error: {e}")
+            return []
+
+    # ✅ FIX: MySQL koristi func.rand()
+    results = query.order_by(func.rand()).offset(offset).limit(limit).all()
+
     out: List[Dict[str, Any]] = []
     for r in results:
         out.append({
@@ -486,31 +503,30 @@ def find_recipes_by_style(db: Session, user_id: int, style_filters: Dict[str, An
             "ingredients": get_ingredients_for_recipe(r.id, db),
             "instructions": getattr(r, "instructions", None),
         })
-    
     return out
 
 
 def describe_style_filters(filters: Dict[str, Any]) -> str:
     parts = []
-    
-    if filters.get("style_tag") == "brzo":
+    tag = filters.get("style_tag", "")
+    if tag == "brzo":
         parts.append("brza jela (do 30 min)")
-    if filters.get("style_tag") == "lagano":
+    elif tag == "lagano":
         parts.append("lagana jela (do 400 kcal)")
-    if filters.get("style_tag") == "hranjivo":
+    elif tag == "hranjivo":
         parts.append("hranjiva jela (visoki proteini)")
-    if filters.get("style_tag") == "zdravo":
+    elif tag == "zdravo":
         parts.append("zdrava jela (do 500 kcal)")
-    if filters.get("style_tag") == "tjestenina":
+    elif tag == "tjestenina":
         parts.append("jela s tjesteninom")
-    if filters.get("style_tag") == "salata":
+    elif tag == "salata":
         parts.append("salate")
-    if filters.get("style_tag") == "juha":
+    elif tag == "juha":
         parts.append("juhe i čorbe")
-    
+
     if not parts:
         return "prijedloge"
-    
+
     return " / ".join(parts)
 
 
@@ -643,19 +659,48 @@ def _cache_get_user_ingredients(user_id: int) -> List[str]:
     finally:
         db.close()
 
+
 def map_user_text_to_ingredient_names(user_id: int, raw_text: str) -> List[str]:
+    """
+    ✅ FIX: Bolje mapiranje - direktan match + fuzzy fallback
+    Rješava problem: "imam piletinu" -> vraćalo losos
+    """
     choices = _cache_get_user_ingredients(user_id)
     if not choices:
         return []
 
+    # Normalizirane choices za usporedbu
+    choices_norm = {strip_accents(normalize_hr(c)).lower(): c for c in choices}
+
     toks = tokens_stemmed(raw_text)
+    raw_toks_norm = [strip_accents(normalize_hr(t)).lower() for t in raw_text.split()]
+
     mapped: List[str] = []
+
+    # 1. Pokušaj direktan match po normaliziranom tekstu
+    for raw_tok in raw_toks_norm:
+        if len(raw_tok) < 3:
+            continue
+        for norm_choice, original_choice in choices_norm.items():
+            # Ako token počinje s istim korijenom
+            if norm_choice.startswith(raw_tok[:4]) or raw_tok.startswith(norm_choice[:4]):
+                if original_choice not in mapped:
+                    mapped.append(original_choice)
+                    print(f"   ✅ Direct match: '{raw_tok}' -> '{original_choice}'")
+                    break
+
+    # 2. Fuzzy match za ostatak
     for t in toks:
+        if len(t) < 3:
+            continue
         hit = best_match(t, choices, score_cutoff=80)
         if hit:
-            name, _ = hit
-            mapped.append(name)
+            name, score = hit
+            if name not in mapped:
+                mapped.append(name)
+                print(f"   ✅ Fuzzy match: '{t}' -> '{name}' (score: {score})")
 
+    # Dedupliciraj
     seen = set()
     out: List[str] = []
     for x in mapped:
@@ -663,6 +708,8 @@ def map_user_text_to_ingredient_names(user_id: int, raw_text: str) -> List[str]:
         if k not in seen:
             seen.add(k)
             out.append(x)
+
+    print(f"   Mapped ingredients: {out}")
     return out
 
 
@@ -714,6 +761,7 @@ def format_recipe_choice(r: Dict[str, Any], idx: int) -> str:
         ing_preview = "(nema sastojaka u bazi)"
     return f"{idx}) {r.get('name','')} — **{kcal}** — **{time_txt}**\n   Sastojci: {ing_preview}"
 
+
 def store_suggestions(user_id: int, mode: str, cursor: int, items: List[Dict[str, Any]], style_filters: Optional[Dict[str, Any]] = None) -> None:
     ctx = manager.user_contexts.get(str(user_id), {})
     ctx["last_suggestions"] = items
@@ -722,6 +770,7 @@ def store_suggestions(user_id: int, mode: str, cursor: int, items: List[Dict[str
     if style_filters:
         ctx["last_style_filters"] = style_filters
     manager.user_contexts[str(user_id)] = ctx
+
 
 def present_suggestions(user_id: int, mode: str, cursor: int, items: List[Dict[str, Any]], style_filters: Optional[Dict[str, Any]] = None) -> str:
     if not items:
@@ -736,6 +785,7 @@ def present_suggestions(user_id: int, mode: str, cursor: int, items: List[Dict[s
     out += "Odaberi: `1`, `2`, `3` (ili napiši naziv). Za nove prijedloge napiši: `novo` / `još`."
     out += "\nZa cooking mode: nakon odabira možeš: `dalje`, `nazad`, `ponovi`, `stop`."
     return out
+
 
 def parse_user_selection(text_msg: str) -> Optional[int]:
     q = normalize_hr(text_msg)
@@ -752,6 +802,7 @@ def parse_user_selection(text_msg: str) -> Optional[int]:
         return 3
 
     return None
+
 
 def start_cooking_from_suggestion(user_id: int, suggestion: Dict[str, Any]) -> str:
     steps = parse_steps_from_instructions(suggestion.get("instructions") or "")
@@ -874,8 +925,10 @@ def find_recipes_by_ingredient_names_all(ingredient_names: List[str], db: Sessio
                 "instructions": rinstructions
             })
         return out
-    except Exception:
+    except Exception as e:
+        print(f"❌ find_recipes_by_ingredient_names_all error: {e}")
         return []
+
 
 def find_recipes_by_ingredient_names_partial(ingredient_names: List[str], db: Session, user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
     if not ingredient_names:
@@ -918,21 +971,29 @@ def find_recipes_by_ingredient_names_partial(ingredient_names: List[str], db: Se
                 "match_count": int(match_count) if match_count is not None else 0
             })
         return out
-    except Exception:
+    except Exception as e:
+        print(f"❌ find_recipes_by_ingredient_names_partial error: {e}")
         return []
 
+
 def find_recipes_under_calories(db: Session, user_id: int, max_calories: int, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
+    """
+    ✅ FIX: func.rand() za MySQL, filter calories > 0, random order
+    """
     if not max_calories or max_calories <= 0:
         return []
+
     results = (
         db.query(Recipe)
         .filter(Recipe.user_id == user_id)
         .filter(Recipe.calories <= max_calories)
-        .order_by(Recipe.calories.asc(), Recipe.name.asc())
+        .filter(Recipe.calories > 0)  # ✅ isključi recepte bez kalorija
+        .order_by(func.rand())         # ✅ MySQL: rand() - uvijek različiti
         .offset(offset)
         .limit(limit)
         .all()
     )
+
     out: List[Dict[str, Any]] = []
     for r in results:
         out.append({
@@ -1005,14 +1066,13 @@ def build_day_plan(db: Session, user_id: int, target_kcal: Optional[int] = None,
     if not recipes:
         return "Nema recepata u tvojoj bazi. Dodaj recepte pa mogu složiti plan.", {}
 
-    # 🆕 Prilagodi target prema user goal-u
     if target_kcal is None:
         if user_goal == "weight_loss":
-            target_kcal = 1600  # Defaultno niže za weight loss
+            target_kcal = 1600
         elif user_goal == "muscle_gain":
-            target_kcal = 2400  # Defaultno više za muscle gain
+            target_kcal = 2400
         else:
-            target_kcal = 1800  # Maintenance
+            target_kcal = 1800
 
     if target_kcal is not None:
         per_meal = max(200, target_kcal // 3)
@@ -1050,11 +1110,10 @@ def build_day_plan(db: Session, user_id: int, target_kcal: Optional[int] = None,
         })
 
     out = "📅 Plan obroka (iz tvoje baze):\n"
-    
-    # 🆕 Prikaži goal poruku
+
     if user_goal:
         out += get_goal_friendly_message(user_goal) + "\n\n"
-    
+
     for it in plan_items:
         kcal = f"{it['calories']} kcal" if it.get("calories") is not None else "?"
         pt = f"{it['prep_time']} min" if it.get("prep_time") is not None else "?"
@@ -1067,7 +1126,7 @@ def build_day_plan(db: Session, user_id: int, target_kcal: Optional[int] = None,
     else:
         out += f"\nUkupno (odabrano): ~{total_kcal} kcal."
 
-    out += "\n\nMožeš pitati: 'zašto si ovo preporučio?' ili odaberi ručak: `1/2/3` pa idemo kuhati."
+    out += "\n\nMožeš pitati: 'zašto si ovo preporučio?' ili odaberi obrok: `1/2/3` pa idemo kuhati."
     ctx = {
         "target_kcal": target_kcal,
         "per_meal": per_meal,
@@ -1077,19 +1136,18 @@ def build_day_plan(db: Session, user_id: int, target_kcal: Optional[int] = None,
     }
     return out, ctx
 
+
 def explain_last_plan(ctx: Dict[str, Any]) -> str:
     if not ctx or not ctx.get("items"):
         return "Nemam zadnje preporuke u kontekstu. Prvo zatraži 'plan obroka za danas' ili 'večera do 300 kcal'."
 
     mode = ctx.get("mode")
     user_goal = ctx.get("user_goal")
-    
+
     lines = []
-    
-    # 🆕 Objasni alergije ako postoje
+
     user_allergies = ctx.get("user_allergies", [])
     if user_allergies:
-        # Mapiraj engleski alergeni na hrvatske nazive za ljepši prikaz
         allergen_display = {
             "eggs": "jaja",
             "milk": "mliječne proizvode",
@@ -1101,18 +1159,17 @@ def explain_last_plan(ctx: Dict[str, Any]) -> str:
             "shellfish": "školjke",
             "sesame": "sezam"
         }
-        
+
         allergens_hr = []
         for allergen in user_allergies:
             allergen_lower = allergen.lower()
             allergens_hr.append(allergen_display.get(allergen_lower, allergen))
-        
+
         if len(allergens_hr) == 1:
             lines.append(f"Alergičan si na {allergens_hr[0]} → automatski sam isključio sve recepte koji to sadrže.")
         else:
             lines.append(f"Alergičan si na: {', '.join(allergens_hr)} → automatski sam isključio sve recepte koji to sadrže.")
-    
-    # 🆕 Objasni goal ako postoji
+
     if user_goal:
         if user_goal == "weight_loss":
             lines.append("Tvoj cilj je mršavljenje → odabrao sam recepte s nižim kalorijama.")
@@ -1120,32 +1177,30 @@ def explain_last_plan(ctx: Dict[str, Any]) -> str:
             lines.append("Tvoj cilj je jačanje mišića → odabrao sam recepte s više proteina i kalorija.")
         elif user_goal == "maintenance":
             lines.append("Tvoj cilj je održavanje → balansirao sam kalorije.")
-    
-    # Objašnjenje po modu
+
     if mode == "low_cal":
         meal_type = ctx.get("meal_type")
         max_cal = ctx.get("max_cal")
-        lines.append(f"Tražio si {meal_type_accusative(meal_type)} do {max_cal} kcal.")
-        lines.append("Odabrao sam recepte koji su najbliži tom limitu, sortirano od najnižih prema višim kalorijama.")
-    
+        lines.append(f"Tražio si {meal_type_accusative(str(meal_type))} do {max_cal} kcal.")
+        lines.append("Odabrao sam recepte koji su u tom kalornom rasponu, nasumičnim redoslijedom.")
+
     elif mode == "style":
         desc = ctx.get("style_description")
         lines.append(f"Tražio si: {desc}.")
         lines.append("Filtrirao sam recepte prema tim kriterijima (brzina, lakoća, hranjivost itd.).")
-    
+
     elif mode == "ingredients":
         lines.append("Pretraživao sam recepte koji sadrže sastojke koje imaš.")
         lines.append("Prioriziram recepte koji imaju sve navedene sastojke.")
-    
+
     else:
-        # Standardni plan obroka
         target = ctx.get("target_kcal")
         per_meal = ctx.get("per_meal")
-        
+
         if target:
             lines.append(f"Odabrao sam recepte da budu blizu ~{per_meal} kcal po obroku (cilj {target} kcal/dan).")
         else:
-            lines.append(f"Odabrao sam recepte koji su najbliže oko ~{per_meal} kcal po obroku (demo logika).")
+            lines.append(f"Odabrao sam recepte koji su najbliže oko ~{per_meal} kcal po obroku.")
         lines.append("Biranje je po najmanjoj razlici kalorija između recepta i ciljanog per-obrok unosa.")
 
     return "🧠 Zašto ove preporuke:\n" + "\n".join([f"• {l}" for l in lines])
@@ -1209,7 +1264,7 @@ def build_health_answer(food: str) -> str:
 
 def cooking_start(db: Session, user_id: int, raw_query: str) -> str:
     term = normalize_hr(raw_query)
-    term = term.replace("krenimo kuhati", "").replace("kreni kuhati", "").replace("kreni kuhat", "").strip()
+    term = term.replace("krenimo kuhati", "").replace("kreni kuhati", "").replace("kreni kuhat", "").replace("kuhajmo", "").strip()
     term = term.replace("recept", "").strip()
     term = re.sub(r"\s+", " ", term).strip()
 
@@ -1235,6 +1290,7 @@ def cooking_start(db: Session, user_id: int, raw_query: str) -> str:
         "Napiši: 'dalje', 'ponovi', 'nazad', 'stop'."
     )
 
+
 def cooking_next(user_id: int) -> str:
     ctx = manager.user_contexts.get(str(user_id))
     if not ctx or not ctx.get("steps"):
@@ -1247,6 +1303,7 @@ def cooking_next(user_id: int) -> str:
     ctx["step"] = idx
     return f"Korak {idx+1}/{len(steps)}: {steps[idx]}"
 
+
 def cooking_back(user_id: int) -> str:
     ctx = manager.user_contexts.get(str(user_id))
     if not ctx or not ctx.get("steps"):
@@ -1256,6 +1313,7 @@ def cooking_back(user_id: int) -> str:
     ctx["step"] = idx
     return f"Korak {idx+1}/{len(steps)}: {steps[idx]}"
 
+
 def cooking_repeat(user_id: int) -> str:
     ctx = manager.user_contexts.get(str(user_id))
     if not ctx or not ctx.get("steps"):
@@ -1263,6 +1321,7 @@ def cooking_repeat(user_id: int) -> str:
     steps = ctx["steps"]
     idx = int(ctx.get("step", 0))
     return f"Korak {idx+1}/{len(steps)}: {steps[idx]}"
+
 
 def cooking_stop(user_id: int) -> str:
     ukey = str(user_id)
@@ -1279,9 +1338,10 @@ def cooking_stop(user_id: int) -> str:
 # =========================
 
 def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
+    # ✅ FIX: Normalize typos prije svega
+    query = normalize_typos(query)
     q = normalize_hr(query)
-    
-    # 🆕 Dohvati user context (goal i allergies)
+
     ctx = manager.user_contexts.get(str(user_id), {})
     user_goal = ctx.get("user_goal")
     user_allergies = ctx.get("user_allergies", [])
@@ -1298,14 +1358,14 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
             "• Recepti iz baze: 'recept pizza'\n"
             "• Pretraga po sastojcima: 'imam piletinu i rajcice'\n"
             "• Low-cal preporuke: 'večera do 300 kcal' (pa odaberi 1/2/3)\n"
-            "• 🆕 Stil preporuke: 'nešto brzo', 'lagano jelo', 'hranjiva večera', 'zdravo'\n"
+            "• Stil preporuke: 'nešto brzo', 'lagano jelo', 'hranjiva večera', 'zdravo'\n"
             "• Zamjene: 'zamjena za mlijeko' ili 'nemam jaja'\n"
             "• Cooking mode: 'krenimo kuhati <recept>' + dalje/nazad/ponovi/stop\n"
             "• Shopping lista: 'shopping lista za <recept>'\n"
             "• Plan dana: 'plan obroka za danas' ili 'plan do 1800 kcal'\n"
             "• Objašnjenje: 'zašto si ovo preporučio?'\n"
             "• Nutricija: 'koliko kalorija ima tuna' / 'koliko proteina ima piletina'\n"
-            "• 🆕 Automatski izbjegavam recepte s tvojim alergenima!"
+            "• Automatski izbjegavam recepte s tvojim alergenima!"
         )
 
     if any(x in q for x in ["bok", "pozdrav", "zdravo", "hej", "dobar dan", "dobro jutro", "dobra večer", "dobra vecer"]):
@@ -1330,24 +1390,22 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
             if max_cal and meal_type:
                 new_cursor = cursor + 3
                 items = find_recipes_under_calories(db, user_id=user_id, max_calories=int(max_cal), limit=3, offset=new_cursor)
-                # 🆕 Filter allergies
                 items = filter_recipes_by_allergies(items, user_allergies, db)
                 header = f"Prijedlozi za {meal_type_accusative(str(meal_type))} do {int(max_cal)} kcal (nastavak):\n\n"
                 return header + present_suggestions(user_id, "low_cal", new_cursor, items)
             return "Ok — napiši opet npr. `večera do 300 kcal` pa ću dati nove prijedloge."
-        
+
         elif last_mode == "style":
             style_filters = ctx.get("last_style_filters")
             if style_filters:
                 new_cursor = cursor + 3
                 items = find_recipes_by_style(db, user_id=user_id, style_filters=style_filters, limit=3, offset=new_cursor)
-                # 🆕 Filter allergies
                 items = filter_recipes_by_allergies(items, user_allergies, db)
                 desc = describe_style_filters(style_filters)
                 header = f"Prijedlozi ({desc}) — nastavak:\n\n"
                 return header + present_suggestions(user_id, "style", new_cursor, items, style_filters)
             return "Ok — napiši opet upit (npr. 'nešto lagano') pa ću dati nove prijedloge."
-        
+
         return "Ok — napiši opet upit (npr. 'nešto brzo', 'večera do 300 kcal') pa ću dati nove prijedloge."
 
     # user selects 1/2/3
@@ -1367,7 +1425,7 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
                 return start_cooking_from_suggestion(user_id=user_id, suggestion=chosen)
 
     # Explain last plan / recommendations
-    if "zašto" in q and any(x in q for x in ["prepor", "ovo", "ovaj", "plan"]):
+    if any(x in q for x in ["zašto", "zasto"]) and any(x in q for x in ["prepor", "ovo", "ovaj", "plan", "predlož", "predloz"]):
         last = ctx.get("last_plan")
         if last:
             return explain_last_plan(last)
@@ -1378,11 +1436,10 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
         target = extract_plan_target_kcal(q)
         txt, plan_ctx = build_day_plan(db, user_id=user_id, target_kcal=target, user_goal=user_goal)
         manager.user_contexts[str(user_id)]["last_plan"] = plan_ctx
-        
-        # 🆕 Filter allergies from plan
+
         plan_items = plan_ctx.get("items", [])
         plan_items = filter_recipes_by_allergies(plan_items, user_allergies, db)
-        
+
         store_suggestions(user_id, mode="plan", cursor=0, items=plan_items)
         return txt
 
@@ -1394,16 +1451,16 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
     if any(x in q for x in ["krenimo kuhati", "kreni kuhati", "kreni kuhat", "kuhajmo"]):
         return cooking_start(db, user_id=user_id, raw_query=q)
 
-    if q in ["dalje", "sljedece", "sljedeći", "sljedeci"]:
+    if q.strip() in ["dalje", "sljedece", "sljedeći", "sljedeci"]:
         return cooking_next(user_id)
 
-    if q in ["nazad", "prethodni", "back"]:
+    if q.strip() in ["nazad", "prethodni", "back"]:
         return cooking_back(user_id)
 
-    if q in ["ponovi", "repeat"]:
+    if q.strip() in ["ponovi", "repeat"]:
         return cooking_repeat(user_id)
 
-    if q in ["stop", "stani", "prekini"]:
+    if q.strip() in ["stop", "stani", "prekini"]:
         return cooking_stop(user_id)
 
     # Substitutions: "nemam X"
@@ -1431,29 +1488,25 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
         ctx["last_style_filters"] = style_filters
 
         items = find_recipes_by_style(db, user_id=user_id, style_filters=style_filters, limit=3, offset=0)
-        
-        # 🆕 Filter allergies
         items = filter_recipes_by_allergies(items, user_allergies, db)
-        
+
         if items:
             desc = describe_style_filters(style_filters)
-            
-            # 🆕 Store last_plan context za "zašto si ovo preporučio?"
             plan_context = {
                 "mode": "style",
                 "style_filters": style_filters,
                 "style_description": desc,
                 "user_goal": user_goal,
-                "user_allergies": user_allergies,  # 🆕
+                "user_allergies": user_allergies,
                 "items": items,
                 "explanation": f"Tražio si {desc}."
             }
             ctx["last_plan"] = plan_context
             manager.user_contexts[str(user_id)] = ctx
-            
+
             header = f"Prijedlozi ({desc}) iz tvoje baze:\n\n"
             return header + present_suggestions(user_id, "style", 0, items, style_filters)
-        
+
         desc = describe_style_filters(style_filters)
         return f"Nemam recepte koji odgovaraju: {desc}. Dodaj još recepata ili probaj drugačiji upit."
 
@@ -1461,40 +1514,56 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
     meal_type = detect_meal_type(q)
     max_cal = extract_max_calories(q)
     if meal_type and max_cal is not None:
-        # 🆕 Adjust calories based on goal
         if user_goal:
             min_cal, adjusted_max = adjust_calories_for_goal(max_cal, user_goal)
             max_cal = adjusted_max
-        
+
         ctx["suggestion_cursor"] = 0
         ctx["last_meal_type"] = meal_type
         ctx["last_max_cal"] = int(max_cal)
-        
+
         items = find_recipes_under_calories(db, user_id=user_id, max_calories=max_cal, limit=3, offset=0)
-        
-        # 🆕 Filter allergies
         items = filter_recipes_by_allergies(items, user_allergies, db)
-        
+
         if items:
-            # 🆕 Store last_plan context za "zašto si ovo preporučio?"
             plan_context = {
                 "mode": "low_cal",
                 "meal_type": meal_type,
                 "max_cal": max_cal,
                 "user_goal": user_goal,
-                "user_allergies": user_allergies,  # 🆕
+                "user_allergies": user_allergies,
                 "items": items,
                 "explanation": f"Tražio si {meal_type_accusative(meal_type)} do {max_cal} kcal."
             }
             ctx["last_plan"] = plan_context
             manager.user_contexts[str(user_id)] = ctx
-            
+
             header = f"Prijedlozi za {meal_type_accusative(meal_type)} do {max_cal} kcal (iz tvoje baze):\n\n"
             if user_goal:
                 header += get_goal_friendly_message(user_goal) + "\n\n"
             return header + present_suggestions(user_id, "low_cal", 0, items)
 
         return f"Nemam recepte u tvojoj bazi do {max_cal} kcal. Dodaj još recepata ili povećaj limit."
+
+    # ✅ FIX: "prijedlog za večeru" -> predloži recepte za taj meal type (bez kcal limita)
+    if is_idea_question(q):
+        idea_meal_type = extract_meal_type_from_idea(q)
+        if idea_meal_type:
+            # Predloži recepte za taj meal type bez kalornog limita
+            items = find_recipes_under_calories(db, user_id=user_id, max_calories=9999, limit=3, offset=0)
+            items = filter_recipes_by_allergies(items, user_allergies, db)
+            if items:
+                header = f"Prijedlozi za {meal_type_accusative(idea_meal_type)}:\n\n"
+                return header + present_suggestions(user_id, "style", 0, items)
+
+        return (
+            "Reci mi jednu od opcija 🙂\n"
+            "• 'večera do 300 kcal'\n"
+            "• 'nešto brzo / lagano / hranjivo / zdravo'\n"
+            "• 'imam <sastojci>'\n"
+            "• 'plan obroka za danas'\n"
+            "• 'recept <naziv>'"
+        )
 
     # "imam ..." -> recipe suggestions by ingredients
     if "imam" in q:
@@ -1507,20 +1576,16 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
             return "Ne prepoznajem sastojke iz tvoje baze. Probaj jednostavnije nazive (npr. 'piletina, jaja, rajčica')."
 
         recipes_all = find_recipes_by_ingredient_names_all(ing_names, db, user_id=user_id, limit=10)
-        
-        # 🆕 Filter allergies
         recipes_all = filter_recipes_by_allergies(recipes_all, user_allergies, db)
-        
+
         if recipes_all:
             first = recipes_all[:3]
-            header = "Na temelju sastojaka koje imaš, evo par prijedloga:\n\n"
+            header = f"Na temelju '{', '.join(ing_names)}', evo prijedloga:\n\n"
             return header + present_suggestions(user_id, "ingredients", 0, first)
 
         partial = find_recipes_by_ingredient_names_partial(ing_names, db, user_id=user_id, limit=10)
-        
-        # 🆕 Filter allergies
         partial = filter_recipes_by_allergies(partial, user_allergies, db)
-        
+
         if partial:
             first = partial[:3]
             header = f"Nemam recept koji sadrži SVE: {', '.join(ing_names)}.\nAli imam najbliže prijedloge:\n\n"
@@ -1539,17 +1604,15 @@ def get_cooking_tip(query: str, db: Session, user_id: int) -> str:
             return out
         return "Nemam taj recept u tvojoj bazi. Dodaj ga u svoje recepte ili napiši naziv nekog svog recepta."
 
-    if is_idea_question(q):
-        return (
-            "Reci mi jednu od opcija 🙂\n"
-            "• 'večera do 300 kcal'\n"
-            "• 'nešto brzo / lagano / hranjivo / zdravo'\n"
-            "• 'imam <sastojci>'\n"
-            "• 'plan obroka za danas'\n"
-            "• 'recept <naziv>'"
-        )
-
-    return "Tu sam! Probaj: 'nešto lagano za večeru', 'brzo jelo', 'večera do 300 kcal', 'imam piletinu i rajcice', ili 'krenimo kuhati pizza'."
+    return (
+        "Tu sam! Probaj:\n"
+        "• 'nešto lagano za večeru'\n"
+        "• 'brzo jelo'\n"
+        "• 'večera do 300 kcal'\n"
+        "• 'imam piletinu i rajcice'\n"
+        "• 'plan obroka za danas'\n"
+        "• 'krenimo kuhati pizza'"
+    )
 
 
 # =========================
@@ -1567,7 +1630,6 @@ async def handle_websocket_message(websocket: WebSocket, user_id: str, message: 
         except Exception:
             uid = 0
 
-        # 🆕 Load user profile ako već nije učitan
         ctx = manager.user_contexts.get(user_id, {})
         if ctx.get("user_goal") is None:
             load_user_profile(uid, db)
