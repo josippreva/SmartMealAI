@@ -2,7 +2,8 @@
 Database connection and models for SmartMeal AI
 - Supports MySQL (default) and SQLite (optional)
 - SQLAlchemy ORM models: User, Recipe, Ingredient, Meal
-- Many-to-many: Recipe <-> Ingredient via ingredient_recipe
+- Many-to-many: Recipe <-> Ingredient via ingredient_recipe (s pivot poljem quantity)
+- Kompatibilnost sa starim nazivima *_per_100g preko izračunatih polja (bez zaokruživanja)
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ from sqlalchemy import (
     ForeignKey,
     Table,
     Text,
+    case,
+    func,
 )
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base, column_property
 
 load_dotenv()
 
@@ -83,12 +86,13 @@ if DEBUG_DB_URL:
 # =========================
 # Association table (many-to-many)
 # =========================
-
+# Laravel pivot: ingredient_recipe(ingredient_id, recipe_id, quantity, created_at, updated_at)
 ingredient_recipe = Table(
     "ingredient_recipe",
     Base.metadata,
     Column("ingredient_id", Integer, ForeignKey("ingredients.id"), primary_key=True),
     Column("recipe_id", Integer, ForeignKey("recipes.id"), primary_key=True),
+    Column("quantity", Float, nullable=True),
 )
 
 # =========================
@@ -146,7 +150,7 @@ class Recipe(Base):
         "Ingredient",
         secondary=ingredient_recipe,
         back_populates="recipes",
-        lazy="selectin",  # važan performance win (eager-ish)
+        lazy="selectin",
     )
 
     meals = relationship("Meal", back_populates="recipe", cascade="all, delete-orphan")
@@ -156,13 +160,49 @@ class Ingredient(Base):
     __tablename__ = "ingredients"
 
     id = Column(Integer, primary_key=True, index=True)
-
     name = Column(String(255), nullable=False, index=True)
 
-    calories_per_100g = Column(Float, nullable=True)
-    protein_per_100g = Column(Float, nullable=True)
-    carbs_per_100g = Column(Float, nullable=True)
-    fat_per_100g = Column(Float, nullable=True)
+    # NOVA Laravel shema
+    unit = Column(String(10), nullable=True)     # 'g' ili 'ml'
+    ref_amount = Column(Integer, nullable=True)  # npr. 100
+
+    calories = Column(Integer, nullable=True)
+    protein = Column(Integer, nullable=True)
+    carbs = Column(Integer, nullable=True)
+    fat = Column(Integer, nullable=True)
+
+    # Kompatibilnost: stari nazivi *_per_100g (bez zaokruživanja)
+    calories_per_100g = column_property(
+        case(
+            ((ref_amount.isnot(None) & (ref_amount > 0)),
+             (func.coalesce(calories, 0) * 100.0) / ref_amount),
+            else_=0.0
+        )
+    )
+
+    protein_per_100g = column_property(
+        case(
+            ((ref_amount.isnot(None) & (ref_amount > 0)),
+             (func.coalesce(protein, 0) * 100.0) / ref_amount),
+            else_=0.0
+        )
+    )
+
+    carbs_per_100g = column_property(
+        case(
+            ((ref_amount.isnot(None) & (ref_amount > 0)),
+             (func.coalesce(carbs, 0) * 100.0) / ref_amount),
+            else_=0.0
+        )
+    )
+
+    fat_per_100g = column_property(
+        case(
+            ((ref_amount.isnot(None) & (ref_amount > 0)),
+             (func.coalesce(fat, 0) * 100.0) / ref_amount),
+            else_=0.0
+        )
+    )
 
     recipes = relationship(
         "Recipe",
